@@ -460,12 +460,17 @@ def run_simulation():
 
             # 게이트 구간 안에 있는 에이전트: 서비스 처리
             if GATE_ZONE_X_START <= px <= GATE_ZONE_X_END:
+                # 태그리스: 무정지 통과 (서비스 불필요, 일반 속도 유지)
+                if agent_data[aid]["is_tagless"] and aid not in in_service:
+                    agent_data[aid]["serviced"] = True
+                    stats["gate_counts"][gi] += 1
+                    stats["service_times"].append(0.0)
+                    # gate_occupied에 영향 없음 (통과만 하므로)
+                    continue
+
+                # 태그 사용자: 서비스 처리
                 if aid not in in_service:
-                    # 태그리스: 일반 보행속도 유지 / 태그: 게이트 통과 속도
-                    if agent_data[aid]["is_tagless"]:
-                        agent.model.desired_speed = agent_data[aid]["original_speed"]
-                    else:
-                        agent.model.desired_speed = GATE_PASS_SPEED  # 0.65 m/s (Gao 실측)
+                    agent.model.desired_speed = GATE_PASS_SPEED  # 0.65 m/s (Gao 실측)
                     in_service[aid] = {
                         "start": current_time,
                         "duration": agent_data[aid]["service_time"],
@@ -487,8 +492,9 @@ def run_simulation():
             dist_to_gate = GATE_X - px
             if 0 < dist_to_gate < 5.0:
                 agent.model.time_gap = PED_TIME_GAP_QUEUE
-                # 내 게이트가 사용 중이면 → 완전 정지
-                if gate_occupied[gi]:
+                # 게이트 직전(0.5m 이내)에서만 점유 확인 후 정지
+                # 그 외에는 줄 서서 접근 (CFSM V2가 자연스럽게 감속)
+                if dist_to_gate < 0.5 and gate_occupied[gi]:
                     agent.model.desired_speed = 0.0
                 else:
                     agent.model.desired_speed = agent_data[aid]["original_speed"]

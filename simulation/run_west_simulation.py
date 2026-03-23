@@ -117,8 +117,8 @@ DIST_ESTIMATION_ERROR = 0.10   # 거리 추정 오차 ±10%
 # 3단계 재선택 거리 (Gao, 2019 현장관측, Fig.9)
 CHOICE_DIST_1ST = 3.0    # 1차 선택: Influence Zone 진입, 전체경로 고려, 확률적
 CHOICE_DIST_2ND = 1.7    # 2차 재선택: 접근거리만, 확률적
-CHOICE_DIST_3RD = 0.25   # 3차 재선택: 카드 태핑 위치 (Gao Fig.9), 확정적
-                          # ← v6에서는 1.0m이었으나 원문은 0.25m
+CHOICE_DIST_3RD = 1.0    # 3차 재선택: 물리 배리어 환경에서는 0.25m에서 횡이동 불가
+                          # Gao 원문 0.25m → 1.0m (배리어 진입 전 정렬 여유 확보)
 
 # 게이트 통과 구간 (서비스 영역)
 GATE_ZONE_X_START = GATE_X - 0.2
@@ -129,9 +129,11 @@ QUEUE_STOP_DIST = 0.5        # 게이트 앞 정지 거리 (m)
 QUEUE_FOLLOW_DIST = 5.0      # 대기열 모드 전환 거리 (m)
 LEADER_FOLLOW_GAP = 0.6      # 앞사람 추종 시 목표 간격 (m) ≈ 2*PED_RADIUS + 여유
 
-# 병목 구간 내 척력 무효화 파라미터
+# 병목 구간 내 척력 감소 파라미터
+# 0.75m 통로, 0.225m 반경 → 벽까지 0.15m 클리어런스
+# 기본 STRENGTH_GEOMETRY=5.0에서는 0.15m 거리에서 반발 과다 → 진입 불가
 BOTTLENECK_STRENGTH_NEIGHBOR = 1.0   # 게이트 내부에서 약한 이웃 반발
-BOTTLENECK_STRENGTH_GEOMETRY = 0.5   # 게이트 내부에서 약한 벽 반발
+BOTTLENECK_STRENGTH_GEOMETRY = 0.2   # 게이트 내부에서 최소 벽 반발 (0.15m 클리어런스용)
 
 OUTPUT_DIR = pathlib.Path(__file__).parent.parent / "output"
 OUTPUT_DIR.mkdir(exist_ok=True)
@@ -350,11 +352,18 @@ def find_leader(agent_pos, gate_idx, sim, agent_data, in_service, my_id):
 def create_simulation():
     gates = calculate_gate_positions()
     # 시뮬레이션용: 통로 폭을 넓힌 배리어 (CFSM 벽 반발력이 0.55m에서 막히므로)
-    # 기하구조 통로 = 실제 폭 + 2*PED_RADIUS 여유 → 보행자 중심이 통과 가능
+    # 단, 인접 게이트 통로가 겹치지 않도록 최대 폭 제한
+    # gate_spacing = 0.85m, 최소 벽 두께 0.10m 유지 → 최대 통로 = 0.75m
+    gate_spacing = GATE_PASSAGE_WIDTH + GATE_HOUSING_WIDTH  # 0.85m
+    MIN_WALL_THICKNESS = 0.10  # 게이트 사이 최소 벽 두께
+    max_passage = gate_spacing - MIN_WALL_THICKNESS  # 0.75m
+    desired_passage = GATE_PASSAGE_WIDTH + 2 * PED_RADIUS  # 1.0m
+    sim_passage = min(desired_passage, max_passage)  # 0.75m
+
     sim_gates = []
     for g in gates:
         sim_g = dict(g)
-        sim_g["passage_width"] = g["passage_width"] + 2 * PED_RADIUS  # 0.55 + 0.45 = 1.0m
+        sim_g["passage_width"] = sim_passage
         sim_gates.append(sim_g)
     walkable, _, _ = build_geometry(sim_gates, include_barrier=True)
     # 시각화용: 실제 폭 배리어
@@ -382,10 +391,10 @@ def create_simulation():
         wp_id = sim.add_waypoint_stage((GATE_X, g["y"]), 0.4)
         gate_wp_ids.append(wp_id)
 
-    # 3단계: 게이트 통과 후 Waypoint
+    # 3단계: 게이트 통과 후 Waypoint (반경 넓게 → 빠르게 exit 전환)
     post_gate_wp_ids = []
     for g in gates:
-        wp_id = sim.add_waypoint_stage((gate_x_end + 2.0, g["y"]), 1.0)
+        wp_id = sim.add_waypoint_stage((gate_x_end + 1.5, g["y"]), 2.0)
         post_gate_wp_ids.append(wp_id)
 
     # 출구
@@ -432,7 +441,8 @@ def create_simulation():
 
     return (sim, gates, walkable, vis_obstacles, gate_openings,
             approach_wp_ids, gate_wp_ids, post_gate_wp_ids, journey_ids,
-            default_journey_id, default_stage_id)
+            default_journey_id, default_stage_id,
+            exit_upper, exit_lower)
 
 
 # =============================================================================
@@ -454,7 +464,8 @@ def run_simulation():
 
     (sim, gates, walkable, obstacles, gate_openings,
      approach_wp_ids, gate_wp_ids, post_gate_wp_ids, journey_ids,
-     default_journey_id, default_stage_id) = create_simulation()
+     default_journey_id, default_stage_id,
+     exit_upper, exit_lower) = create_simulation()
 
     rng = np.random.default_rng(42)
     total_steps = int(SIM_TIME / DT)
@@ -577,13 +588,21 @@ def run_simulation():
                     stats["gate_counts"][gi_s] += 1
                 stats["service_times"].append(in_service[aid_s]["duration"])
                 gate_occupied[gi_s] = False
-                # 속도/척력 복원 (에이전트가 아직 sim에 있을 때만)
+                # 속도/척력 복원 + exit 스테이지로 직접 전환
                 for agent in sim.agents():
                     if agent.id == aid_s:
                         agent.model.desired_speed = ad_s["original_speed"]
                         agent.model.time_gap = PED_TIME_GAP
                         agent.model.strength_neighbor_repulsion = PED_STRENGTH_NEIGHBOR
                         agent.model.strength_geometry_repulsion = PED_STRENGTH_GEOMETRY
+                        # 가까운 출구로 직접 전환 (waypoint 미스매치 방지)
+                        gy = gates[gi_s]["y"] if gi_s >= 0 else agent.position[1]
+                        target_exit = exit_upper if gy > CONCOURSE_WIDTH / 2 else exit_lower
+                        try:
+                            sim.switch_agent_journey(
+                                aid_s, journey_ids[gi_s], target_exit)
+                        except Exception:
+                            pass
                         break
             del in_service[aid_s]
 
@@ -639,15 +658,37 @@ def run_simulation():
                 agent.model.strength_neighbor_repulsion = BOTTLENECK_STRENGTH_NEIGHBOR
                 agent.model.strength_geometry_repulsion = BOTTLENECK_STRENGTH_GEOMETRY
 
+                # ── 물리적 위치 기반 게이트 보정 ──
+                # 재선택으로 gate_idx와 실제 위치가 불일치할 수 있음
+                # → 게이트 존 진입 시 가장 가까운 게이트로 강제 보정
+                if aid not in in_service:
+                    dists_to_gates = [abs(py - g["y"]) for g in gates]
+                    nearest_gate = int(np.argmin(dists_to_gates))
+                    if nearest_gate != gi:
+                        gi = nearest_gate
+                        ad["gate_idx"] = gi
+                        try:
+                            sim.switch_agent_journey(
+                                aid, journey_ids[gi], post_gate_wp_ids[gi])
+                        except Exception:
+                            pass
+
                 # 태그리스: 무정지 통과
                 if ad["is_tagless"] and aid not in in_service:
                     ad["serviced"] = True
                     ad["state"] = "done"
                     stats["gate_counts"][gi] += 1
                     stats["service_times"].append(0.0)
-                    # 척력 복원
+                    # 척력 복원 + exit으로 직접 전환
                     agent.model.strength_neighbor_repulsion = PED_STRENGTH_NEIGHBOR
                     agent.model.strength_geometry_repulsion = PED_STRENGTH_GEOMETRY
+                    gy = gates[gi]["y"]
+                    target_exit = exit_upper if gy > CONCOURSE_WIDTH / 2 else exit_lower
+                    try:
+                        sim.switch_agent_journey(
+                            aid, journey_ids[gi], target_exit)
+                    except Exception:
+                        pass
                     continue
 
                 # 태그 사용자: 서비스 시작 (완료 체크는 상단에서 위치 무관으로 처리)
@@ -667,6 +708,9 @@ def run_simulation():
             # ────────────────────────────────────────────────
             if 0 < dist_to_gate < QUEUE_FOLLOW_DIST:
                 agent.model.time_gap = PED_TIME_GAP_QUEUE
+                # 게이트 1.0m 이내: 벽 반발 미리 감소 (진입 직전 밀려남 방지)
+                if dist_to_gate < 1.0:
+                    agent.model.strength_geometry_repulsion = BOTTLENECK_STRENGTH_GEOMETRY
 
                 if dist_to_gate <= QUEUE_STOP_DIST and gate_occupied[gi]:
                     # 게이트 직전: 점유 중이면 정지 대기
@@ -873,13 +917,24 @@ def draw_frame(ax, positions, gates, obstacles, gate_openings, time_sec):
                 ox, oy = geom.exterior.xy
                 ax.fill(ox, oy, color='#546E7A', edgecolor='#263238', linewidth=0.3)
 
+    # 시뮬레이션 통로 (0.75m, 연한 노랑) — 실제 보행 가능 영역
+    gate_spacing = GATE_PASSAGE_WIDTH + GATE_HOUSING_WIDTH
+    sim_pw = min(GATE_PASSAGE_WIDTH + 2 * PED_RADIUS, gate_spacing - 0.10)
+    for g in gates:
+        ax.add_patch(mpatches.Rectangle(
+            (GATE_X - 0.01, g["y"] - sim_pw / 2),
+            GATE_LENGTH + 0.02, sim_pw,
+            facecolor='#FFF9C4', edgecolor='#F9A825', linewidth=0.5,
+            alpha=0.4, zorder=2))
+
+    # 실제 게이트 통로 (0.55m, 초록)
     for opening in gate_openings:
         ox, oy = opening.exterior.xy
-        ax.fill(ox, oy, color='#66BB6A', edgecolor='#2E7D32', linewidth=0.8, alpha=0.5)
+        ax.fill(ox, oy, color='#66BB6A', edgecolor='#2E7D32', linewidth=0.8, alpha=0.5, zorder=3)
 
     for g in gates:
         ax.text(g["x"] + GATE_LENGTH / 2, g["y"], str(g["id"] + 1),
-                ha='center', va='center', fontsize=7, fontweight='bold', color='#1B5E20')
+                ha='center', va='center', fontsize=7, fontweight='bold', color='#1B5E20', zorder=4)
 
     for stair in STAIRS:
         ax.plot([stair["x"], stair["x"]],

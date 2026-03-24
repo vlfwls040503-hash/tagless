@@ -288,9 +288,13 @@ def create_simulation():
     # 시각화용: 배리어 포함
     _, vis_obstacles, gate_openings = build_geometry(gates, include_barrier=True)
 
-    model = jps.SocialForceModel(
-        body_force=SFM_BODY_FORCE,
-        friction=SFM_FRICTION,
+    model = jps.GeneralizedCentrifugalForceModel(
+        strength_neighbor_repulsion=0.3,
+        strength_geometry_repulsion=0.2,
+        max_neighbor_interaction_distance=2.0,
+        max_geometry_interaction_distance=2.0,
+        max_neighbor_repulsion_force=9.0,
+        max_geometry_repulsion_force=3.0,
     )
 
     sim = jps.Simulation(model=model, geometry=walkable, dt=DT)
@@ -446,17 +450,17 @@ def run_simulation():
 
                 try:
                     agent_id = sim.add_agent(
-                        jps.SocialForceModelAgentParameters(
+                        jps.GeneralizedCentrifugalForceModelAgentParameters(
                             journey_id=jid,
                             stage_id=sid,
                             position=(spawn_x, spawn_y),
                             desired_speed=desired_speed,
-                            mass=SFM_MASS,
-                            reaction_time=SFM_REACTION_TIME,
-                            agent_scale=SFM_AGENT_SCALE,
-                            obstacle_scale=SFM_OBSTACLE_SCALE,
-                            force_distance=SFM_FORCE_DISTANCE,
-                            radius=SFM_RADIUS,
+                            mass=1.0,
+                            tau=0.5,
+                            a_v=1.0,
+                            a_min=0.2,
+                            b_min=0.2,
+                            b_max=0.4,
                         ))
                     agent_data[agent_id] = {
                         "gate_idx": gate_idx,
@@ -490,7 +494,8 @@ def run_simulation():
             if gi >= 0:
                 gate_occupied[gi] = True
 
-        # ── 서비스 완료 체크 (위치 무관) ──
+        # ── 서비스 완료 체크: AnyLogic Linear Service 방식 ──
+        # Phase 1: 서비스 시간 만료 → 게이트 출구 waypoint로 걸어서 이동
         finished_aids = []
         for aid_s, svc in in_service.items():
             if current_time - svc["start"] >= svc["duration"]:
@@ -499,24 +504,46 @@ def run_simulation():
             if aid_s in agent_data:
                 ad_s = agent_data[aid_s]
                 gi_s = ad_s["gate_idx"]
-                ad_s["serviced"] = True
-                ad_s["state"] = "done"
-                if gi_s >= 0:
-                    stats["gate_counts"][gi_s] += 1
+                # 서비스 시간 완료 → 게이트 출구까지 걸어서 나감 (텔레포트 X)
+                ad_s["state"] = "in_gate_walking"
                 stats["service_times"].append(in_service[aid_s]["duration"])
-                gate_occupied[gi_s] = False
+                gate_occupied[gi_s] = False  # 게이트 해제 (다음 사람 진입 가능)
                 for agent in sim.agents():
                     if agent.id == aid_s:
-                        agent.model.desired_speed = ad_s["original_speed"]
-                        gy = gates[gi_s]["y"]
-                        target_exit = exit_upper if gy > CONCOURSE_WIDTH / 2 else exit_lower
+                        agent.model.desired_speed = GATE_PASS_SPEED  # 0.65 m/s로 걸어나감
                         try:
                             sim.switch_agent_journey(
-                                aid_s, journey_ids[gi_s], target_exit)
+                                aid_s, journey_ids[gi_s], post_gate_wp_ids[gi_s])
                         except Exception:
                             pass
                         break
             del in_service[aid_s]
+
+        # Phase 2: 게이트 출구 통과 완료 체크 (물리적으로 게이트를 빠져나갔는지)
+        gate_x_end = GATE_X + GATE_LENGTH
+        for agent in sim.agents():
+            aid = agent.id
+            if aid not in agent_data:
+                continue
+            ad = agent_data[aid]
+            if ad["state"] != "in_gate_walking":
+                continue
+            px, py = agent.position
+            # 게이트 출구(x_end) 넘어갔으면 → 서비스 완전 완료
+            if px > gate_x_end + 0.3:
+                gi_s = ad["gate_idx"]
+                ad["serviced"] = True
+                ad["state"] = "done"
+                if gi_s >= 0:
+                    stats["gate_counts"][gi_s] += 1
+                agent.model.desired_speed = ad["original_speed"]
+                gy = gates[gi_s]["y"]
+                target_exit = exit_upper if gy > CONCOURSE_WIDTH / 2 else exit_lower
+                try:
+                    sim.switch_agent_journey(
+                        aid, journey_ids[gi_s], target_exit)
+                except Exception:
+                    pass
 
         # ── 에이전트별 상태 제어 ──
         gate_queue = count_gate_queue(sim, gates, agent_data)
@@ -532,6 +559,10 @@ def run_simulation():
             px, py = agent.position
             gi = ad["gate_idx"]
             dist_to_gate = GATE_X - px
+
+            # 게이트 통과 중인 에이전트는 건드리지 않음
+            if ad["state"] == "in_gate_walking":
+                continue
 
             # ── Phase 0: Influence Zone 진입 ──
             if ad["choice_stage"] == 0 and dist_to_gate <= CHOICE_DIST_1ST:
@@ -570,18 +601,15 @@ def run_simulation():
                         except Exception:
                             pass
 
-                # 태그리스: 무정지 통과
+                # 태그리스: 일반 보행속도로 게이트를 걸어서 통과 (무정지)
                 if ad["is_tagless"] and aid not in in_service:
-                    ad["serviced"] = True
-                    ad["state"] = "done"
-                    stats["gate_counts"][gi] += 1
+                    ad["state"] = "in_gate_walking"
                     stats["service_times"].append(0.0)
+                    # 속도 유지한 채 게이트 출구 waypoint로 이동
                     agent.model.desired_speed = ad["original_speed"]
-                    gy = gates[gi]["y"]
-                    target_exit = exit_upper if gy > CONCOURSE_WIDTH / 2 else exit_lower
                     try:
                         sim.switch_agent_journey(
-                            aid, journey_ids[gi], target_exit)
+                            aid, journey_ids[gi], post_gate_wp_ids[gi])
                     except Exception:
                         pass
                     continue

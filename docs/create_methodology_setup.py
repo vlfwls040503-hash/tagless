@@ -89,15 +89,42 @@ doc.add_paragraph(
     '보행자 이동 모델은 Generalized Centrifugal Force Model (GCFM, Chraibi et al., 2010)을 채택한다.'
 )
 
-doc.add_paragraph('GCFM 선정 이유:')
-for r in [
-    'SFM 계열의 힘(force) 기반 모델로, 대기행렬에서 줄서기 행태가 자연 발생 '
-    '(전방 인력 + 후방 압력의 균형)',
-    '타원형 보행자 모델 - 보행 속도에 따라 어깨축이 축소되어 좁은 공간 접근 시 현실적 체형 변화 반영',
-    'JuPedSim 개발팀(율리히 연구소)이 직접 개발한 모델로 프레임워크와의 호환성 최적',
-    'PTV Viswalk 등 상용 소프트웨어도 SFM/힘 기반 모델을 채택하고 있어 방법론적 정합성 확보',
-]:
-    doc.add_paragraph(r, style='List Bullet')
+doc.add_paragraph('GCFM 선정 이유 (선행연구 기반):')
+
+doc.add_paragraph(
+    '첫째, SFM의 구조적 한계 해결. '
+    'Chraibi et al. (2010)은 기존 SFM에서 발생하는 보행자 간 겹침(overlapping), '
+    '비현실적 진동(oscillation), 속도 이상 문제를 GCFM이 해결함을 보였다. '
+    'Jain et al. (2025)의 벤치마크 연구에서도 SFM(원형/타원형 모두)은 '
+    '병목 시나리오에서 80% 이상 성공률을 달성하지 못한 반면, '
+    'CFM 계열이 상대적으로 양호한 성능을 보였다.'
+)
+
+doc.add_paragraph(
+    '둘째, 타원형 보행자 모델에 의한 현실적 병목 통과. '
+    'GCFM은 보행자를 원형이 아닌 타원형으로 모델링하며, '
+    '보행 속도에 따라 어깨축(b)이 축소된다. Chraibi et al. (2010)은 '
+    '원형 모델이 보행자의 비대칭적 공간 점유(진행 방향 vs 어깨 방향)를 '
+    '반영하지 못함을 지적하며, 타원형 모델이 좁은 병목(bottleneck)에서 '
+    '실험 데이터와 더 잘 일치함을 다양한 출구 폭 실험으로 검증하였다.'
+)
+
+doc.add_paragraph(
+    '셋째, 힘 기반 모델의 대기행렬 형성. '
+    'Lin et al. (2023)은 Modified SFM을 이용하여 지하철 게이트 기계가 '
+    '보행자 흐름에 미치는 영향을 시뮬레이션하였다. '
+    '힘 기반 모델에서 게이트 앞 보행자는 전방 인력과 후방 압력의 균형으로 '
+    '자연스러운 줄서기(fan/arch 형태)를 형성하며, '
+    '이는 속도 기반 모델(CFSM 등)에서 코드로 강제해야 하는 행태이다. '
+    '게이트가 적절히 배치되면 오히려 보행자 흐름을 질서화하여 '
+    '통과 효율을 높일 수 있음을 보였다.'
+)
+
+doc.add_paragraph(
+    '넷째, PTV Viswalk 등 상용 소프트웨어도 SFM/힘 기반 모델을 채택하고 있어 '
+    '방법론적 정합성이 확보된다. 또한 GCFM은 JuPedSim 개발팀(율리히 연구소)이 '
+    '직접 개발한 모델로 프레임워크와의 호환성이 최적이다.'
+)
 
 add_heading('2.1.1 게이트 통과 메커니즘', level=3)
 doc.add_paragraph(

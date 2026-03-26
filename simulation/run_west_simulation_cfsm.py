@@ -258,13 +258,14 @@ def create_simulation():
         approach_wp_ids.append(wp_id)
 
     # 2단계: Queue Stage (게이트 앞 대기열)
-    # head = 게이트 바로 앞, 이후 0.5m 간격으로 뒤로
+    # head = 게이트 입구, 이후 0.3m 간격으로 뒤로 (실제 대기 간격)
     queue_stage_ids = []
     queue_stages = []
+    QUEUE_SPACING = 0.3
     for i, g in enumerate(gates):
         positions = []
         for j in range(5):
-            positions.append((GATE_X - 0.1 - j * 0.5, g["y"]))
+            positions.append((GATE_X - j * QUEUE_SPACING, g["y"]))
         qid = sim.add_queue_stage(positions)
         queue_stage_ids.append(qid)
         queue_stages.append(sim.get_stage(qid))

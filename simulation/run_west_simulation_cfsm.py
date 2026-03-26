@@ -258,13 +258,13 @@ def create_simulation():
         approach_wp_ids.append(wp_id)
 
     # 2단계: Queue Stage (게이트 앞 대기열)
-    # 각 게이트마다 대기 위치 5개: 게이트 뒤(-x 방향)로 0.8m 간격
+    # head = 게이트 바로 앞, 이후 0.5m 간격으로 뒤로
     queue_stage_ids = []
-    queue_stages = []  # NotifiableQueueStage 객체
+    queue_stages = []
     for i, g in enumerate(gates):
         positions = []
         for j in range(5):
-            positions.append((GATE_X - 0.3 - j * 0.8, g["y"]))
+            positions.append((GATE_X - 0.1 - j * 0.5, g["y"]))
         qid = sim.add_queue_stage(positions)
         queue_stage_ids.append(qid)
         queue_stages.append(sim.get_stage(qid))
@@ -452,14 +452,20 @@ def run_simulation():
             arrival_idx += 1
 
         # ── queue_stage 기반 서비스 처리 ──
+        GATE_CLEAR_TIME = 0.5  # 게이트 문 닫히는 시간 (초)
         for gi in range(N_GATES):
             qs = queue_stages[gi]
 
-            # 서비스 중인 에이전트가 있는지 확인
+            # Phase A: 클리어링 중 — 문 닫히는 시간 대기
+            if gate_service[gi] is not None and gate_service[gi].get("clearing"):
+                if current_time - gate_service[gi]["clear_start"] >= GATE_CLEAR_TIME:
+                    gate_service[gi] = None  # 클리어 완료 → 다음 사람 서비스 가능
+                continue
+
+            # Phase B: 서비스 중 → 완료 시 pop + 클리어링
             if gate_service[gi] is not None:
                 svc = gate_service[gi]
                 if current_time - svc["start"] >= svc["duration"]:
-                    # 서비스 완료 -> pop
                     aid_done = svc["agent_id"]
                     qs.pop(1)
                     if aid_done not in passed_agents:
@@ -468,27 +474,27 @@ def run_simulation():
                         passed_agents.add(aid_done)
                     if aid_done in agent_data:
                         agent_data[aid_done]["serviced"] = True
-                    gate_service[gi] = None
+                    gate_service[gi] = {"clearing": True, "clear_start": current_time}
+                continue
 
-            # 서비스 중이 아니고, 큐에 에이전트가 있으면 서비스 시작
-            if gate_service[gi] is None and qs.count_enqueued() > 0:
+            # Phase C: 게이트 비어있고 큐에 사람 있으면 서비스 시작
+            if qs.count_enqueued() > 0:
                 enqueued = qs.enqueued()
                 if enqueued:
                     head_aid = enqueued[0]
                     if head_aid in agent_data:
                         ad = agent_data[head_aid]
                         if ad["serviced"] or head_aid in passed_agents:
-                            # 이미 서비스된 에이전트가 큐에 있으면 pop
                             qs.pop(1)
                             continue
-                        is_tagless = ad["is_tagless"]
-                        if is_tagless:
-                            # 태그리스: 즉시 pop (서비스 시간 0)
+                        if ad["is_tagless"]:
+                            # 태그리스: 즉시 pop → 짧은 클리어링
                             qs.pop(1)
                             stats["service_times"].append(0.0)
                             stats["gate_counts"][gi] += 1
                             ad["serviced"] = True
                             passed_agents.add(head_aid)
+                            gate_service[gi] = {"clearing": True, "clear_start": current_time}
                         else:
                             # 태그: 서비스 시작
                             gate_service[gi] = {
@@ -498,7 +504,7 @@ def run_simulation():
                             }
 
         # ── 게이트 점유 상태 (재선택용) ──
-        gate_occupied = [gate_service[gi] is not None for gi in range(N_GATES)]
+        gate_occupied = [gate_service[gi] is not None for gi in range(N_GATES)]  # 서비스 중 + 클리어링 중 모두 점유
 
         # ── 게이트 선택 / 경로 변경: Gao (2019) ──
         gate_queue = count_gate_queue_from_stages(queue_stages)
@@ -506,7 +512,7 @@ def run_simulation():
         # 서비스 중인 에이전트 ID 집합 (재선택 방지)
         in_service_aids = set()
         for gi_s in range(N_GATES):
-            if gate_service[gi_s] is not None:
+            if gate_service[gi_s] is not None and "agent_id" in gate_service[gi_s]:
                 in_service_aids.add(gate_service[gi_s]["agent_id"])
 
         for agent in sim.agents():

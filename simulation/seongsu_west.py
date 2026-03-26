@@ -101,12 +101,15 @@ def calculate_gate_positions():
 # =============================================================================
 # 7. 기하구조 생성
 # =============================================================================
-def build_geometry(gates, include_barrier=True):
+def build_geometry(gates, include_barrier=True, passage_width_override=None):
     """
     walkable area 생성
 
-    include_barrier=True:  게이트 배리어를 물리적 장애물로 포함 (시각화용)
-    include_barrier=False: 배리어 없이 열린 공간 (시뮬레이션용, 게이트 통과는 코드로 제어)
+    include_barrier=True:  게이트 배리어를 물리적 장애물로 포함
+    include_barrier=False: 배리어 없이 열린 공간
+    passage_width_override: 시뮬레이션용 통로 폭 (None이면 게이트 원래 폭 사용)
+        - 시뮬레이션: 1.0m 이상 (CFSM 에이전트 낑김 방지, 처리량은 서비스 시간 모델이 제어)
+        - 시각화: None (원래 0.55m)
     """
     # 외곽 경계 (상단 왼쪽 들여쓰기 포함)
     outer = Polygon([
@@ -126,7 +129,7 @@ def build_geometry(gates, include_barrier=True):
     # 게이트 배리어
     gate_openings = []
     for g in gates:
-        pw = g["passage_width"]
+        pw = passage_width_override if passage_width_override else g["passage_width"]
         opening = Polygon([
             (GATE_X - 0.01, g["y"] - pw / 2),
             (GATE_X + GATE_LENGTH + 0.01, g["y"] - pw / 2),

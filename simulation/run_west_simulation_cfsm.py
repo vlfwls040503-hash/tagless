@@ -291,7 +291,7 @@ def create_simulation():
     # - 물리적 벽: 게이트 사이를 막아서 우회 불가
     # - 넓은 통로(1.2m): CFSM 에이전트가 자유롭게 통과 (낑김 없음)
     # - 실제 처리량: 서비스 시간 모델이 제어 (물리적 폭이 아님)
-    SIM_PASSAGE_WIDTH = 1.2  # 시뮬레이션용 통로 폭 (실제 0.55m → 1.2m)
+    SIM_PASSAGE_WIDTH = 0.70  # 시뮬레이션용 통로 폭 (실제 0.55m → 0.70m, 벽 0.15m 유지)
     walkable, _, _ = build_geometry(gates, include_barrier=True,
                                     passage_width_override=SIM_PASSAGE_WIDTH)
     # 시각화용: 실제 폭(0.55m)으로 표시

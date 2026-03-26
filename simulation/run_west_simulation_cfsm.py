@@ -109,10 +109,10 @@ GATE_ZONE_X_START = GATE_X - 0.3
 GATE_ZONE_X_END = GATE_X + GATE_LENGTH + 0.3
 
 # 대기열 제어
-QUEUE_STOP_DIST = 0.5
+QUEUE_STOP_DIST = 1.0     # 게이트 1m 전에서 대기 (0.5m → 1.0m: 통로 진입 방지)
 QUEUE_FOLLOW_DIST = 5.0
 LEADER_FOLLOW_GAP = 0.6
-QUEUE_MIN_SPEED = 0.05   # CFSM: 완전 정지 대신 극저속
+QUEUE_MIN_SPEED = 0.0    # CFSM: 완전 정지 가능 (GCFM과 달리 벽 반발 불필요)
 
 OUTPUT_DIR = pathlib.Path(__file__).parent.parent / "output"
 OUTPUT_DIR.mkdir(exist_ok=True)
@@ -608,12 +608,18 @@ def run_simulation():
                         except Exception:
                             pass
 
+                # 게이트 점유 중이면 진입 불가 — 정지 후 대기
+                if gate_occupied[gi] and aid not in in_service:
+                    set_agent_speed(agent, QUEUE_MIN_SPEED)
+                    ad["state"] = "queuing"
+                    continue
+
                 # 태그리스: 일반 보행속도로 게이트를 걸어서 통과 (무정지)
                 if ad["is_tagless"] and aid not in in_service:
                     ad["state"] = "in_gate_walking"
                     ad["gate_walk_start"] = current_time
                     stats["service_times"].append(0.0)
-                    # 속도 유지한 채 게이트 출구 waypoint로 이동
+                    gate_occupied[gi] = True  # 태그리스도 통과 중 점유
                     set_agent_speed(agent, ad["original_speed"])
                     try:
                         sim.switch_agent_journey(

@@ -51,7 +51,7 @@ plt.rcParams['axes.unicode_minus'] = False
 # =============================================================================
 # 시뮬레이션 파라미터
 # =============================================================================
-SIM_TIME = 300.0
+SIM_TIME = 330.0  # 2차 열차 도착 후 잔류 에이전트 완전 소화 여유
 DT = 0.05
 
 # =============================================================================
@@ -486,11 +486,19 @@ def run_simulation():
             arrival_idx += 1
 
         # ── 게이트 점유 상태 ──
+        # in_service(서비스 중) + in_gate_walking(통로 통과 중) 모두 점유로 처리
+        # CFSM에서 0.55m 통로에 2명이 동시 진입하면 교착(deadlock) 발생
         gate_occupied = [False] * N_GATES
         for aid_s in in_service:
             gi = agent_data[aid_s]["gate_idx"]
             if gi >= 0:
                 gate_occupied[gi] = True
+        for agent in sim.agents():
+            aid = agent.id
+            if aid in agent_data and agent_data[aid]["state"] == "in_gate_walking":
+                gi = agent_data[aid]["gate_idx"]
+                if gi >= 0:
+                    gate_occupied[gi] = True
 
         # ── 서비스 완료 체크: AnyLogic Linear Service 방식 ──
         # Phase 1: 서비스 시간 만료 → 게이트 출구 waypoint로 걸어서 이동
@@ -504,6 +512,7 @@ def run_simulation():
                 gi_s = ad_s["gate_idx"]
                 # 서비스 시간 완료 → 게이트 출구까지 걸어서 나감 (텔레포트 X)
                 ad_s["state"] = "in_gate_walking"
+                ad_s["gate_walk_start"] = current_time
                 stats["service_times"].append(in_service[aid_s]["duration"])
                 gate_occupied[gi_s] = False  # 게이트 해제 (다음 사람 진입 가능)
                 for agent in sim.agents():
@@ -602,6 +611,7 @@ def run_simulation():
                 # 태그리스: 일반 보행속도로 게이트를 걸어서 통과 (무정지)
                 if ad["is_tagless"] and aid not in in_service:
                     ad["state"] = "in_gate_walking"
+                    ad["gate_walk_start"] = current_time
                     stats["service_times"].append(0.0)
                     # 속도 유지한 채 게이트 출구 waypoint로 이동
                     set_agent_speed(agent, ad["original_speed"])
@@ -666,7 +676,33 @@ def run_simulation():
                     set_agent_speed(agent, ad["original_speed"])
                     ad["state"] = "flowing"
 
-        # ── 안전장치 ──
+        # ── 안전장치: in_gate_walking 교착 해소 ──
+        GATE_WALK_TIMEOUT = 15.0  # 15초 이상 게이트 통과 중이면 강제 완료
+        for agent in sim.agents():
+            aid = agent.id
+            if aid not in agent_data:
+                continue
+            ad = agent_data[aid]
+            if ad["state"] != "in_gate_walking":
+                continue
+            # in_gate_walking 진입 시간 기록
+            if "gate_walk_start" not in ad:
+                ad["gate_walk_start"] = current_time
+            elif current_time - ad["gate_walk_start"] > GATE_WALK_TIMEOUT:
+                gi_s = ad["gate_idx"]
+                ad["serviced"] = True
+                ad["state"] = "done"
+                if gi_s >= 0:
+                    stats["gate_counts"][gi_s] += 1
+                set_agent_speed(agent, ad["original_speed"])
+                gy = gates[gi_s]["y"]
+                target_exit = exit_upper if gy > CONCOURSE_WIDTH / 2 else exit_lower
+                try:
+                    sim.switch_agent_journey(aid, journey_ids[gi_s], target_exit)
+                except Exception:
+                    pass
+
+        # ── 안전장치: 일반 ──
         STUCK_TIMEOUT = 60.0
         for agent in sim.agents():
             aid = agent.id

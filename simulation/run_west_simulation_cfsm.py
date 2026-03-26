@@ -599,33 +599,28 @@ def run_simulation():
             if gi < 0:
                 continue
 
-            # ── Phase 1: 게이트 구간 (서비스 영역) ──
-            if GATE_ZONE_X_START <= px <= GATE_ZONE_X_END:
-                # 물리적 위치 기반 게이트 보정
-                if aid not in in_service:
-                    dists_to_gates = [abs(py - g["y"]) for g in gates]
-                    nearest_gate = int(np.argmin(dists_to_gates))
-                    if nearest_gate != gi:
-                        gi = nearest_gate
-                        ad["gate_idx"] = gi
-                        try:
-                            sim.switch_agent_journey(
-                                aid, journey_ids[gi], post_gate_wp_ids[gi])
-                        except Exception:
-                            pass
+            # ── 개별 서비스 포인트 방식 ──
+            # 각 게이트는 독립적 서비스 포인트 (AnyLogic Service Point 방식)
+            # 판단 기준: 자기 게이트 위치(gate_x, gate_y)에 대한 근접도
+            gate_y = gates[gi]["y"]
+            dist_to_my_gate = np.hypot(px - GATE_X, py - gate_y)
 
-                # 게이트 점유 중이면 진입 불가 — 정지 후 대기
-                if gate_occupied[gi] and aid not in in_service:
+            # 서비스 시작 반경: 게이트 중심에서 1.0m 이내
+            SERVICE_TRIGGER_DIST = 1.0
+
+            if dist_to_my_gate <= SERVICE_TRIGGER_DIST and aid not in in_service:
+                # 게이트 점유 중이면 → 정지 대기
+                if gate_occupied[gi]:
                     set_agent_speed(agent, QUEUE_MIN_SPEED)
                     ad["state"] = "queuing"
                     continue
 
-                # 태그리스: 일반 보행속도로 게이트를 걸어서 통과 (무정지)
-                if ad["is_tagless"] and aid not in in_service:
+                # 태그리스: 무정지 통과
+                if ad["is_tagless"]:
                     ad["state"] = "in_gate_walking"
                     ad["gate_walk_start"] = current_time
                     stats["service_times"].append(0.0)
-                    gate_occupied[gi] = True  # 태그리스도 통과 중 점유
+                    gate_occupied[gi] = True
                     set_agent_speed(agent, ad["original_speed"])
                     try:
                         sim.switch_agent_journey(
@@ -634,42 +629,22 @@ def run_simulation():
                         pass
                     continue
 
-                # 태그 사용자: 서비스 시작 (속도 감소하며 통과)
-                if aid not in in_service:
-                    ad["state"] = "in_gate"
-                    set_agent_speed(agent, GATE_PASS_SPEED)
-                    in_service[aid] = {
-                        "start": current_time,
-                        "duration": ad["service_time"],
-                    }
-                    gate_occupied[gi] = True
+                # 태그: 서비스 시작
+                ad["state"] = "in_gate"
+                set_agent_speed(agent, GATE_PASS_SPEED)
+                in_service[aid] = {
+                    "start": current_time,
+                    "duration": ad["service_time"],
+                }
+                gate_occupied[gi] = True
                 continue
 
-            # ── Phase 2: 대기열 구간 ──
-            if 0 < dist_to_gate < QUEUE_FOLLOW_DIST:
-                if dist_to_gate <= QUEUE_STOP_DIST and gate_occupied[gi]:
-                    set_agent_speed(agent, QUEUE_MIN_SPEED)
-                    ad["state"] = "queuing"
-                elif dist_to_gate <= QUEUE_STOP_DIST and not gate_occupied[gi]:
-                    set_agent_speed(agent, ad["original_speed"])
-                    ad["state"] = "flowing"
-                else:
-                    leader_pos = find_leader(
-                        (px, py), gi, sim, agent_data, in_service, aid)
-                    if leader_pos is not None:
-                        gap = leader_pos[0] - px
-                        if gap < LEADER_FOLLOW_GAP:
-                            set_agent_speed(agent, max(
-                                QUEUE_MIN_SPEED,
-                                ad["original_speed"] * (gap / LEADER_FOLLOW_GAP)))
-                            ad["state"] = "queuing"
-                        else:
-                            set_agent_speed(agent, ad["original_speed"])
-                            ad["state"] = "flowing"
-                    else:
-                        set_agent_speed(agent, ad["original_speed"])
-                        ad["state"] = "flowing"
-            else:
+            # 서비스 영역 밖 → 정상 보행
+            # CFSM이 앞사람과의 간격을 자동으로 조절 (자연 대기열)
+            if ad["state"] == "queuing" and not gate_occupied[gi]:
+                set_agent_speed(agent, ad["original_speed"])
+                ad["state"] = "flowing"
+            elif ad["state"] != "queuing":
                 ad["state"] = "flowing"
 
         # ── 대기열 복구 ──

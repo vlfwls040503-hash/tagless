@@ -255,7 +255,7 @@ def create_simulation():
     # 1단계: 접근 Waypoint (게이트 선택 후 도달 -> x=10.0)
     approach_wp_ids = []
     for g in gates:
-        wp_id = sim.add_waypoint_stage((10.0, g["y"]), 0.5)
+        wp_id = sim.add_waypoint_stage((8.0, g["y"]), 0.5)
         approach_wp_ids.append(wp_id)
 
     # 2단계: 게이트 출구 Waypoint (서비스 완료 후 재투입 지점)
@@ -469,8 +469,18 @@ def run_simulation():
             if ad["serviced"] or ad.get("queued"):
                 continue
             px = agent.position[0]
-            if px > 10.5 and ad["gate_idx"] >= 0:
-                # 에이전트가 게이트 접근 구역 도달 -> 시뮬레이션에서 제거, 소프트웨어 큐에 추가
+            gi = ad["gate_idx"]
+            if gi >= 0:
+                # 대기행렬 뒤 위치 계산 (동적)
+                n_in_queue = len(sw_queue[gi])
+                if n_in_queue == 0:
+                    queue_entry_x = QUEUE_HEAD_X  # 11.7 (게이트 바로 앞)
+                else:
+                    queue_entry_x = QUEUE_HEAD_X - n_in_queue * QUEUE_SPACING - 0.3
+            else:
+                queue_entry_x = 11.5  # 게이트 미배정 시 기본값
+            if px > queue_entry_x and gi >= 0:
+                # 에이전트가 대기행렬 뒤 도달 → 시뮬레이션에서 제거, 소프트웨어 큐에 추가
                 ad["queued"] = True
                 ad["queue_enter_time"] = current_time
                 sw_queue[ad["gate_idx"]].append(aid)

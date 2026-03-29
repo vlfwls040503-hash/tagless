@@ -101,16 +101,20 @@ def calculate_gate_positions():
 # =============================================================================
 # 7. 기하구조 생성
 # =============================================================================
-def build_geometry(gates, include_barrier=True, passage_width_override=None):
+def build_geometry(gates, include_barrier=True, passage_width_override=None,
+                   barrier_thickness=None):
     """
     walkable area 생성
 
     include_barrier=True:  게이트 배리어를 물리적 장애물로 포함
     include_barrier=False: 배리어 없이 열린 공간
     passage_width_override: 시뮬레이션용 통로 폭 (None이면 게이트 원래 폭 사용)
-        - 시뮬레이션: 1.0m 이상 (CFSM 에이전트 낑김 방지, 처리량은 서비스 시간 모델이 제어)
-        - 시각화: None (원래 0.55m)
+    barrier_thickness: 배리어 두께 (None이면 GATE_LENGTH 사용)
+        - 시뮬레이션: 0.2m (얇은 벽 → 낑김 방지, 우회 차단)
+        - 시각화: None (원래 1.5m)
     """
+    bt = barrier_thickness if barrier_thickness else GATE_LENGTH
+
     # 외곽 경계 (상단 왼쪽 들여쓰기 포함)
     outer = Polygon([
         (0, 0),
@@ -132,8 +136,8 @@ def build_geometry(gates, include_barrier=True, passage_width_override=None):
         pw = passage_width_override if passage_width_override else g["passage_width"]
         opening = Polygon([
             (GATE_X - 0.01, g["y"] - pw / 2),
-            (GATE_X + GATE_LENGTH + 0.01, g["y"] - pw / 2),
-            (GATE_X + GATE_LENGTH + 0.01, g["y"] + pw / 2),
+            (GATE_X + bt + 0.01, g["y"] - pw / 2),
+            (GATE_X + bt + 0.01, g["y"] + pw / 2),
             (GATE_X - 0.01, g["y"] + pw / 2),
         ])
         gate_openings.append(opening)
@@ -141,8 +145,8 @@ def build_geometry(gates, include_barrier=True, passage_width_override=None):
     if include_barrier:
         barrier_full = Polygon([
             (GATE_X, BARRIER_Y_BOTTOM),
-            (GATE_X + GATE_LENGTH, BARRIER_Y_BOTTOM),
-            (GATE_X + GATE_LENGTH, BARRIER_Y_TOP),
+            (GATE_X + bt, BARRIER_Y_BOTTOM),
+            (GATE_X + bt, BARRIER_Y_TOP),
             (GATE_X, BARRIER_Y_TOP),
         ])
         barrier_solid = barrier_full

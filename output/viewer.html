@@ -1,0 +1,152 @@
+<!DOCTYPE html>
+<html><head><meta charset="UTF-8"><title>성수역 시뮬레이션 뷰어</title></head>
+<body style="margin:0;background:#111;color:#eee;font-family:sans-serif">
+<div style="padding:8px;background:#222;display:flex;gap:8px;align-items:center">
+  <button onclick="togglePlay()" id="pb" style="padding:6px 14px;font-size:16px;cursor:pointer">▶</button>
+  <button onclick="randAgent()" style="padding:6px 10px;cursor:pointer">🎲 랜덤</button>
+  <button onclick="randVib()" style="padding:6px 10px;cursor:pointer;color:#ff6b6b">🎲 진동</button>
+  <input type="range" id="sl" style="flex:1" min="0" max="0" value="0" oninput="manual()">
+  <span id="td" style="min-width:80px;font-size:14px">t=0s</span>
+  <span id="ag" style="min-width:150px;font-size:12px;color:#888"></span>
+</div>
+<canvas id="c"></canvas>
+<script>
+const W=30,H=25,GX=12,GL=1.5,PW=.55,HW=.3,N=7,BY=3,TY=22;
+const ch=N*PW+(N+1)*HW,cb=(BY+TY)/2-ch/2;
+const GY=[];for(let i=0;i<N;i++)GY.push(cb+HW+i*(PW+HW)+PW/2);
+
+let AG={},ST=[],T=[],sel=null,ti=0,run=false,iv,keys;
+
+fetch('traj_by_agent.json').then(r=>r.json()).then(ag=>{
+  AG=ag;keys=Object.keys(AG).map(Number);
+  const ts=new Set();
+  Object.values(AG).forEach(pts=>pts.forEach(p=>ts.add(p[0])));
+  T=[...ts].sort((a,b)=>a-b);
+  document.getElementById('sl').max=T.length-1;
+  return fetch('traj_stats.json');
+}).then(r=>r.json()).then(st=>{
+  ST=st;
+  fit();draw();
+});
+
+function fit(){
+  const c=document.getElementById('c');
+  c.width=innerWidth;
+  c.height=innerHeight-44;
+}
+window.onresize=()=>{fit();draw();}
+
+function togglePlay(){
+  if(run){clearInterval(iv);run=false;document.getElementById('pb').textContent='▶';}
+  else{run=true;document.getElementById('pb').textContent='⏸';
+    iv=setInterval(()=>{
+      ti++;if(ti>=T.length){ti=0;if(sel)randAgent();}
+      document.getElementById('sl').value=ti;
+      document.getElementById('td').textContent='t='+T[ti]+'s';
+      draw();
+    },60);
+  }
+}
+function manual(){ti=+document.getElementById('sl').value;document.getElementById('td').textContent='t='+T[ti]+'s';draw();}
+
+function randAgent(){
+  // moving 궤적이 20개 이상이고 진동 적은 정상 에이전트만
+  const normal=ST.filter(s=>s[1]<20 && AG[s[0]] && AG[s[0]].filter(p=>p[3]==='moving').length>=20);
+  if(!normal.length)return;
+  const s=normal[Math.floor(Math.random()*normal.length)];
+  pickAgent(s[0]);
+}
+function randVib(){
+  const vibs=ST.filter(s=>s[1]>=20 && AG[s[0]] && AG[s[0]].filter(p=>p[3]==='moving').length>=20);
+  if(!vibs.length)return;
+  const s=vibs[Math.floor(Math.random()*vibs.length)];
+  pickAgent(s[0]);
+}
+function pickAgent(aid){
+  sel=aid;
+  const pts=AG[aid];
+  if(pts&&pts.length){
+    const idx=T.findIndex(t=>t>=pts[0][0]);
+    if(idx>=0){ti=Math.max(0,idx-5);document.getElementById('sl').value=ti;}
+  }
+  const s=ST.find(x=>x[0]===aid);
+  document.getElementById('ag').textContent=
+    `ID${aid} G${s?s[3]+1:'?'} | 전환${s?s[1]:'-'}회 | 체류${s?s[2]:'-'}s`;
+  if(!run){document.getElementById('td').textContent='t='+T[ti]+'s';draw();}
+}
+
+function draw(){
+  const c=document.getElementById('c'),x=c.getContext('2d');
+  if(!c.width)return;
+  const s=Math.min(c.width/(W+2),c.height/(H+2));
+  const ox=(c.width-W*s)/2,oy=c.height-(c.height-H*s)/2;
+  const X=v=>ox+v*s,Y=v=>oy-v*s;
+
+  x.fillStyle='#111';x.fillRect(0,0,c.width,c.height);
+
+  // 외곽
+  x.strokeStyle='#333';x.lineWidth=1;x.beginPath();
+  x.moveTo(X(0),Y(0));x.lineTo(X(W),Y(0));x.lineTo(X(W),Y(25));
+  x.lineTo(X(12),Y(25));x.lineTo(X(12),Y(22));x.lineTo(X(0),Y(22));
+  x.closePath();x.stroke();
+
+  // 배리어
+  x.fillStyle='#1a1a2e';x.fillRect(X(GX),Y(TY),GL*s,(TY-BY)*s);
+  GY.forEach((gy,i)=>{
+    x.fillStyle='#1b4332';x.fillRect(X(GX),Y(gy+PW/2),GL*s,PW*s);
+    x.fillStyle='#555';x.font=Math.max(9,s*.3)+'px sans-serif';
+    x.fillText('G'+(i+1),X(GX+.15),Y(gy)+3);
+  });
+
+  // 계단
+  x.fillStyle='#e94560';x.globalAlpha=.15;
+  x.fillRect(X(2.5),Y(18),s,3*s);x.fillRect(X(2.5),Y(11),s,3*s);
+  x.globalAlpha=1;
+
+  const t=T[ti]||0;
+  const col={moving:'#4fc3f7',queue:'#EF6C00',service:'#C62828',passed:'#444'};
+  let cnt=0;
+
+  // 선택 궤적
+  if(sel&&AG[sel]){
+    const pts=AG[sel];
+    const past=pts.filter(p=>p[0]<=t&&p[1]>=0&&p[1]<=W);
+    const future=pts.filter(p=>p[0]>t&&p[1]>=0&&p[1]<=W);
+    if(past.length>1){
+      x.beginPath();x.moveTo(X(past[0][1]),Y(past[0][2]));
+      past.forEach(p=>x.lineTo(X(p[1]),Y(p[2])));
+      x.strokeStyle='#ffeb3b';x.lineWidth=2.5;x.globalAlpha=.5;x.stroke();x.globalAlpha=1;
+    }
+    if(future.length>1){
+      x.beginPath();x.moveTo(X(future[0][1]),Y(future[0][2]));
+      future.forEach(p=>x.lineTo(X(p[1]),Y(p[2])));
+      x.strokeStyle='#555';x.lineWidth=1;x.setLineDash([3,3]);x.stroke();x.setLineDash([]);
+    }
+    // 시작점
+    if(pts.length){{x.beginPath();x.arc(X(pts[0][1]),Y(pts[0][2]),5,0,Math.PI*2);x.fillStyle='#00e676';x.fill();}}
+  }
+
+  // 에이전트 점
+  for(const[aid,pts]of Object.entries(AG)){
+    let best=null,bd=999;
+    for(const p of pts){const d=Math.abs(p[0]-t);if(d<bd){bd=d;best=p;}}
+    if(!best||bd>.3||best[1]<0||best[1]>W)continue;
+    cnt++;
+    const isSel=+aid===sel;
+    x.beginPath();x.arc(X(best[1]),Y(best[2]),isSel?8:3,0,Math.PI*2);
+    x.fillStyle=isSel?'#ffeb3b':(col[best[3]]||'#888');
+    x.globalAlpha=isSel?1:.5;x.fill();
+    if(isSel){x.strokeStyle='#fff';x.lineWidth=2;x.globalAlpha=1;x.stroke();}
+    x.globalAlpha=1;
+  }
+
+  x.fillStyle='#fff';x.font='bold 13px sans-serif';
+  x.fillText('t='+t+'s | '+cnt+'명',8,16);
+
+  // 선택 에이전트가 끝나면 자동 랜덤
+  if(sel&&AG[sel]){
+    const pts=AG[sel];
+    if(pts.length&&t>pts[pts.length-1][0]+2&&run) randAgent();
+  }
+}
+</script></body></html>

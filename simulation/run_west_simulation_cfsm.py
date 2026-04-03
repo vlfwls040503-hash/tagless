@@ -47,16 +47,21 @@ plt.rcParams['axes.unicode_minus'] = False
 # =============================================================================
 # 시뮬레이션 파라미터
 # =============================================================================
-SIM_TIME = 330.0  # 2차 열차 도착 후 잔류 에이전트 완전 소화 여유
+SIM_TIME = 600.0  # 대규모 피크 시뮬레이션
 DT = 0.05
 
 # =============================================================================
 # 도착 모델
 # =============================================================================
 TRAIN_INTERVAL = 180.0
-TRAIN_ALIGHTING = 40
-PLATOON_SPREAD = 15.0
+TRAIN_ALIGHTING = 234  # 08-09시 평일 평균 (11,214명/h ÷ 24편 × 서쪽50%)
+PLATOON_SPREAD = 50.0  # 플랫폼 하차 → 계단 도달 시간차 (열차 길이 ~200m)
 FIRST_TRAIN_TIME = 5.0
+
+# 계단 방출율 (Weidmann 1993: 1.25명/s/m, 하행)
+STAIR_WIDTH = 3.7             # 성수역 계단 폭 (도면 계측)
+STAIR_DISCHARGE_RATE = 1.25   # Weidmann 하행 최대
+STAIR_CAPACITY = STAIR_WIDTH * STAIR_DISCHARGE_RATE  # ~4.6명/s per stair
 
 # =============================================================================
 # 보행자 속도 파라미터
@@ -100,7 +105,7 @@ CHOICE_DIST_1ST = 9.0   # 계단 직후 선택 (x~3~4에서 발동) -> 처음부
 CHOICE_DIST_2ND = 1.7   # 조건부 재선택 (대기열 3명+ 일 때만)
 
 # 대기열 내 재선택 (LRP)
-QUEUE_RESELECT_ENABLED = True   # True: 대기 중 게이트 변경 가능, False: 대기열 확정
+QUEUE_RESELECT_ENABLED = True   # 대기 중 게이트 변경 가능
 QUEUE_RESELECT_INTERVAL = 1.0   # 재선택 판단 주기 (초)
 QUEUE_RESELECT_MIN_QUEUE = 3    # 현재 큐 최소 인원 (이상일 때만 재선택 고려)
 QUEUE_RESELECT_MIN_DIFF = 2     # 새 큐가 이만큼 짧아야 이동
@@ -110,9 +115,10 @@ CHOICE_DIST_3RD = 1.0   # 제거됨 (사용 안 함)
 GATE_ZONE_X_START = GATE_X - 0.3
 GATE_ZONE_X_END = GATE_X + GATE_LENGTH + 0.3
 
-# 소프트웨어 큐 시각화 파라미터
+# 소프트웨어 큐 파라미터
 QUEUE_HEAD_X = GATE_X - 0.3   # 큐 head 위치 (게이트 0.3m 앞)
 QUEUE_SPACING = 0.5            # 대기 간격
+QUEUE_MAX_LENGTH = 999         # 큐 제한 없음
 
 OUTPUT_DIR = pathlib.Path(__file__).parent.parent / "output"
 OUTPUT_DIR.mkdir(exist_ok=True)
@@ -122,16 +128,41 @@ OUTPUT_DIR.mkdir(exist_ok=True)
 # 유틸 함수
 # =============================================================================
 def generate_arrival_schedule(rng, sim_time):
+    """열차별 계단 1개만 사용하는 도착 스케줄.
+    성수역 섬식 승강장: 내선(상행)→lower계단(idx=1), 외선(하행)→upper계단(idx=0)
+    열차가 교대로 도착하므로 계단도 교대.
+    방출율 제약: Fruin LOS E 기준.
+    """
+    min_gap = 1.0 / STAIR_CAPACITY
+
     arrivals = []
     train_time = FIRST_TRAIN_TIME
+    train_count = 0
     while train_time < sim_time:
         n_passengers = rng.poisson(TRAIN_ALIGHTING)
+        # 열차별 계단 1개: 짝수번째=upper(0), 홀수번째=lower(1)
+        stair_idx = train_count % 2
+
+        times = []
         for _ in range(n_passengers):
-            arrival_t = train_time + abs(rng.normal(PLATOON_SPREAD / 2, PLATOON_SPREAD / 4))
-            if arrival_t < sim_time:
-                arrivals.append(arrival_t)
+            raw_t = train_time + abs(rng.normal(PLATOON_SPREAD / 2, PLATOON_SPREAD / 4))
+            times.append(raw_t)
+        times.sort()
+
+        # 방출율 제약
+        for j in range(1, len(times)):
+            earliest = times[j - 1] + min_gap
+            if times[j] < earliest:
+                times[j] = earliest
+
+        for t in times:
+            if t < sim_time:
+                arrivals.append((t, stair_idx))
+
         train_time += TRAIN_INTERVAL
-    arrivals.sort()
+        train_count += 1
+
+    arrivals.sort(key=lambda x: x[0])
     return arrivals
 
 
@@ -370,6 +401,8 @@ def run_simulation():
 
     # 소프트웨어 큐: 게이트별 FIFO 리스트 (agent_id 저장)
     sw_queue = [[] for _ in range(N_GATES)]
+    last_queue_entry_time = [-999.0] * N_GATES  # 게이트별 마지막 큐 진입 시각
+    QUEUE_ENTRY_MIN_GAP = 0.5  # 큐 진입 최소 간격 (초) — 1명 줄 서는 시간
 
     video_frames = []
     frame_interval = int(0.5 / DT)
@@ -385,10 +418,13 @@ def run_simulation():
     for step in range(total_steps):
         current_time = step * DT
 
-        # ── 보행자 생성 ──
+        # ── 보행자 생성 (모든 큐 꽉 차면 스폰 지연 = 승강장 대기) ──
         while (arrival_idx < len(arrival_times) and
-               arrival_times[arrival_idx] <= current_time):
-            stair = STAIRS[rng.integers(0, len(STAIRS))]
+               arrival_times[arrival_idx][0] <= current_time):
+            if all(len(sw_queue[gi]) >= QUEUE_MAX_LENGTH for gi in range(N_GATES)):
+                break
+            arr_time, stair_idx = arrival_times[arrival_idx]
+            stair = STAIRS[stair_idx]
             desired_speed = np.clip(
                 rng.normal(PED_SPEED_MEAN, PED_SPEED_STD),
                 PED_SPEED_MIN, PED_SPEED_MAX)
@@ -456,11 +492,22 @@ def run_simulation():
                     continue
 
             if not spawned:
-                arrival_times.insert(arrival_idx + 1, current_time + DT * 2)
+                arrival_times.insert(arrival_idx + 1, (current_time + DT * 2, stair_idx))
 
             arrival_idx += 1
 
         # ── 소프트웨어 큐: 접근 구역 도달 에이전트 제거 (sim.iterate 전) ──
+        # 스텝 시작 시 큐 tail 위치 스냅샷 (연쇄 진입 방지)
+        queue_tail_snap = []
+        for gi in range(N_GATES):
+            n_q = len(sw_queue[gi])
+            if n_q == 0:
+                queue_tail_snap.append(QUEUE_HEAD_X)
+            else:
+                queue_tail_snap.append(QUEUE_HEAD_X - n_q * QUEUE_SPACING - 0.3)
+
+        # 게이트별로 tail에 가장 가까운 에이전트 1명만 진입 (자연스러운 줄서기)
+        gate_best = [None] * N_GATES  # (aid, px)
         for agent in list(sim.agents()):
             aid = agent.id
             if aid not in agent_data:
@@ -470,21 +517,23 @@ def run_simulation():
                 continue
             px = agent.position[0]
             gi = ad["gate_idx"]
-            if gi >= 0:
-                # 대기행렬 뒤 위치 계산 (동적)
-                n_in_queue = len(sw_queue[gi])
-                if n_in_queue == 0:
-                    queue_entry_x = QUEUE_HEAD_X  # 11.7 (게이트 바로 앞)
-                else:
-                    queue_entry_x = QUEUE_HEAD_X - n_in_queue * QUEUE_SPACING - 0.3
-            else:
-                queue_entry_x = 11.5  # 게이트 미배정 시 기본값
-            if px > queue_entry_x and gi >= 0:
-                # 에이전트가 대기행렬 뒤 도달 → 시뮬레이션에서 제거, 소프트웨어 큐에 추가
+            if gi < 0:
+                continue
+            if px > queue_tail_snap[gi] and len(sw_queue[gi]) < QUEUE_MAX_LENGTH:
+                if gate_best[gi] is None or px > gate_best[gi][1]:
+                    gate_best[gi] = (aid, px)
+
+        for gi in range(N_GATES):
+            if gate_best[gi] is not None:
+                if current_time - last_queue_entry_time[gi] < QUEUE_ENTRY_MIN_GAP:
+                    continue  # 이전 진입 후 0.5초 안 됨
+                aid = gate_best[gi][0]
+                ad = agent_data[aid]
                 ad["queued"] = True
                 ad["queue_enter_time"] = current_time
-                sw_queue[ad["gate_idx"]].append(aid)
+                sw_queue[gi].append(aid)
                 sim.mark_agent_for_removal(aid)
+                last_queue_entry_time[gi] = current_time
 
         # ── 소프트웨어 큐 서비스 처리 ──
         for gi in range(N_GATES):
@@ -881,7 +930,7 @@ def create_snapshots(frames, gates, obstacles, gate_openings):
 def create_mp4(frames, gates, obstacles, gate_openings):
     from matplotlib.animation import FuncAnimation, FFMpegWriter
     import imageio_ffmpeg
-    target_frames = [(t, pos) for t, pos in frames if t <= 60]
+    target_frames = [(t, pos) for t, pos in frames if t <= 120]
     if not target_frames:
         return
     fig, ax = plt.subplots(figsize=(14, 8))

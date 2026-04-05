@@ -1,0 +1,409 @@
+<!DOCTYPE html>
+<html><head><meta charset="UTF-8"><title>개별 궤적 분석기</title>
+<style>
+* { box-sizing: border-box; margin: 0; }
+body { background: #0d1117; color: #c9d1d9; font-family: 'Segoe UI', sans-serif; display: flex; height: 100vh; overflow: hidden; }
+
+#sidebar { width: 340px; min-width: 340px; background: #161b22; display: flex; flex-direction: column; border-right: 1px solid #30363d; }
+#sidebar h2 { padding: 12px 16px; font-size: 14px; border-bottom: 1px solid #30363d; background: #0d1117; }
+
+#filter-bar { padding: 8px 12px; border-bottom: 1px solid #30363d; display: flex; gap: 6px; flex-wrap: wrap; }
+#filter-bar input, #filter-bar select { background: #0d1117; color: #c9d1d9; border: 1px solid #30363d; padding: 4px 8px; border-radius: 4px; font-size: 12px; }
+#filter-bar input { width: 80px; }
+#filter-bar select { width: 90px; }
+
+#agent-list { flex: 1; overflow-y: auto; }
+.agent-item { padding: 8px 12px; border-bottom: 1px solid #21262d; cursor: pointer; font-size: 12px; display: flex; justify-content: space-between; }
+.agent-item:hover { background: #21262d; }
+.agent-item.selected { background: #1f6feb33; border-left: 3px solid #58a6ff; }
+.agent-item .tag { font-size: 10px; padding: 1px 5px; border-radius: 3px; }
+.tag-normal { background: #238636; }
+.tag-reversal { background: #da3633; }
+.tag-stall { background: #d29922; }
+
+#main { flex: 1; display: flex; flex-direction: column; }
+
+#top-bar { padding: 8px 16px; background: #161b22; border-bottom: 1px solid #30363d; display: flex; align-items: center; gap: 12px; font-size: 13px; }
+#top-bar button { background: #21262d; color: #c9d1d9; border: 1px solid #30363d; padding: 5px 12px; border-radius: 4px; cursor: pointer; }
+#top-bar button:hover { background: #30363d; }
+#time-slider { flex: 1; }
+
+#canvas-wrap { flex: 1; position: relative; }
+#canvas-wrap canvas { width: 100%; height: 100%; }
+
+#detail-panel { height: 200px; min-height: 150px; background: #161b22; border-top: 1px solid #30363d; display: flex; }
+#info-box { width: 240px; padding: 12px; font-size: 12px; border-right: 1px solid #30363d; overflow-y: auto; }
+#info-box dt { color: #8b949e; margin-top: 6px; }
+#info-box dd { color: #f0f6fc; font-weight: bold; }
+
+#timeline-canvas { flex: 1; }
+</style>
+</head>
+<body>
+
+<div id="sidebar">
+  <h2>Agent List (<span id="count">0</span>)</h2>
+  <div id="filter-bar">
+    <input type="text" id="search" placeholder="ID 검색">
+    <select id="gate-filter"><option value="">전체 게이트</option></select>
+    <select id="type-filter">
+      <option value="">전체</option>
+      <option value="normal">정상</option>
+      <option value="reversal">역행</option>
+      <option value="stall">정체</option>
+    </select>
+  </div>
+  <div id="agent-list"></div>
+</div>
+
+<div id="main">
+  <div id="top-bar">
+    <button id="play-btn" onclick="togglePlay()">&#9654;</button>
+    <span id="time-display">t = 0.0s</span>
+    <input type="range" id="time-slider" min="0" max="1000" value="0" oninput="onSlider()">
+    <span id="agent-label" style="color:#58a6ff">-</span>
+  </div>
+
+  <div id="canvas-wrap"><canvas id="map"></canvas></div>
+
+  <div id="detail-panel">
+    <div id="info-box">
+      <dl>
+        <dt>Agent ID</dt><dd id="d-id">-</dd>
+        <dt>Gate</dt><dd id="d-gate">-</dd>
+        <dt>State</dt><dd id="d-state">-</dd>
+        <dt>Duration</dt><dd id="d-dur">-</dd>
+        <dt>Total Reversal</dt><dd id="d-rev">-</dd>
+        <dt>Approach Dwell</dt><dd id="d-dwell">-</dd>
+        <dt>Detour Ratio</dt><dd id="d-detour">-</dd>
+      </dl>
+    </div>
+    <canvas id="timeline-canvas"></canvas>
+  </div>
+</div>
+
+<script>
+// ── 상수 ──
+const GX = 12, GL = 1.5, PW = 0.55, HW = 0.3, N_GATES = 7, BY = 3, TY = 22;
+const ch = N_GATES * PW + (N_GATES + 1) * HW;
+const cb = (BY + TY) / 2 - ch / 2;
+const GY = [];
+for (let i = 0; i < N_GATES; i++) GY.push(cb + HW + i * (PW + HW) + PW / 2);
+
+let AG = {}, STATS = {}, T = [], sel = null, ti = 0, run = false, iv;
+let agentMeta = {}; // {aid: {type, gate, rev, dwell, detour, dur, traj}}
+
+// ── 데이터 로드 ──
+Promise.all([
+  fetch('traj_by_agent.json').then(r => r.json()),
+  fetch('traj_stats.json').then(r => r.json()),
+  fetch('agent_vibration_stats.csv').then(r => r.text()),
+]).then(([agents, stats, vibCsv]) => {
+  AG = agents;
+
+  // traj_stats: [aid, total_rev, approach_dwell, gate_idx]
+  stats.forEach(s => {
+    STATS[s[0]] = { rev: s[1], dwell: s[2], gate: s[3] };
+  });
+
+  // vibration csv
+  const lines = vibCsv.trim().split('\n');
+  const hdr = lines[0].split(',');
+  for (let i = 1; i < lines.length; i++) {
+    const vals = lines[i].split(',');
+    const aid = +vals[0];
+    if (!agentMeta[aid]) agentMeta[aid] = {};
+    agentMeta[aid].x_rev = +vals[1];
+    agentMeta[aid].y_rev = +vals[2];
+    agentMeta[aid].total_rev = +vals[3];
+    agentMeta[aid].dwell = +vals[4];
+    agentMeta[aid].dur = +vals[5];
+    agentMeta[aid].detour = +vals[6];
+    agentMeta[aid].gate = +vals[hdr.indexOf('gate_idx')];
+  }
+
+  // 타입 분류
+  for (const [aid, pts] of Object.entries(AG)) {
+    const id = +aid;
+    if (!agentMeta[id]) agentMeta[id] = {};
+    const m = agentMeta[id];
+    m.traj = pts;
+    const s = STATS[id];
+    if (s) {
+      m.rev = s.rev; m.dwell = s.dwell; m.gate = s.gate;
+    }
+    // 역행 감지
+    let hasBacktrack = false;
+    for (let j = 1; j < pts.length; j++) {
+      const dx = pts[j][1] - pts[j-1][1];
+      if (dx < -0.5 && pts[j][3] === 'moving' && Math.abs(dx) < 5) { hasBacktrack = true; break; }
+    }
+    // 정체 감지
+    let hasStall = false;
+    for (let j = 0; j < pts.length; j++) {
+      if (pts[j][3] !== 'moving' || pts[j][1] < GX - 5) continue;
+      let k = j;
+      while (k < pts.length && pts[k][3] === 'moving' && pts[k][1] < GX && pts[k][1] > GX - 5.5) k++;
+      if (k < pts.length && pts[k][0] - pts[j][0] >= 5) { hasStall = true; break; }
+    }
+    m.type = hasBacktrack ? 'reversal' : hasStall ? 'stall' : 'normal';
+  }
+
+  // 타임 인덱스
+  const ts = new Set();
+  Object.values(AG).forEach(pts => pts.forEach(p => ts.add(p[0])));
+  T = [...ts].sort((a, b) => a - b);
+  document.getElementById('time-slider').max = T.length - 1;
+
+  // 게이트 필터
+  const gf = document.getElementById('gate-filter');
+  for (let i = 0; i < N_GATES; i++) {
+    const o = document.createElement('option');
+    o.value = i; o.textContent = 'G' + (i + 1);
+    gf.appendChild(o);
+  }
+
+  buildList();
+  fit();
+  draw();
+  drawTimeline();
+});
+
+// ── 에이전트 목록 ──
+function buildList() {
+  const list = document.getElementById('agent-list');
+  const search = document.getElementById('search').value;
+  const gateF = document.getElementById('gate-filter').value;
+  const typeF = document.getElementById('type-filter').value;
+
+  list.innerHTML = '';
+  const ids = Object.keys(agentMeta).map(Number).sort((a, b) => a - b);
+  let shown = 0;
+  for (const id of ids) {
+    const m = agentMeta[id];
+    if (!m.traj || m.traj.length < 5) continue;
+    if (search && !String(id).includes(search)) continue;
+    if (gateF !== '' && m.gate !== +gateF) continue;
+    if (typeF && m.type !== typeF) continue;
+    shown++;
+    const div = document.createElement('div');
+    div.className = 'agent-item' + (sel === id ? ' selected' : '');
+    div.innerHTML = `
+      <span>ID ${id} | G${(m.gate||0)+1} | ${(m.dur||0).toFixed(1)}s</span>
+      <span class="tag tag-${m.type}">${m.type}</span>
+    `;
+    div.onclick = () => selectAgent(id);
+    list.appendChild(div);
+  }
+  document.getElementById('count').textContent = shown;
+}
+
+document.getElementById('search').oninput = buildList;
+document.getElementById('gate-filter').onchange = buildList;
+document.getElementById('type-filter').onchange = buildList;
+
+function selectAgent(aid) {
+  sel = aid;
+  const m = agentMeta[aid] || {};
+  const pts = AG[aid];
+  if (pts && pts.length) {
+    const idx = T.findIndex(t => t >= pts[0][0]);
+    if (idx >= 0) { ti = Math.max(0, idx - 3); document.getElementById('time-slider').value = ti; }
+  }
+  document.getElementById('agent-label').textContent = 'Agent ' + aid;
+  document.getElementById('d-id').textContent = aid;
+  document.getElementById('d-gate').textContent = 'G' + ((m.gate || 0) + 1);
+  document.getElementById('d-state').textContent = m.type || '-';
+  document.getElementById('d-dur').textContent = (m.dur || 0).toFixed(1) + 's';
+  document.getElementById('d-rev').textContent = m.total_rev || m.rev || 0;
+  document.getElementById('d-dwell').textContent = (m.dwell || 0).toFixed(1) + 's';
+  document.getElementById('d-detour').textContent = (m.detour || 0).toFixed(3);
+  buildList();
+  draw();
+  drawTimeline();
+}
+
+// ── 재생 ──
+function togglePlay() {
+  if (run) { clearInterval(iv); run = false; document.getElementById('play-btn').innerHTML = '&#9654;'; }
+  else {
+    run = true; document.getElementById('play-btn').innerHTML = '&#9646;&#9646;';
+    iv = setInterval(() => {
+      ti++; if (ti >= T.length) ti = 0;
+      document.getElementById('time-slider').value = ti;
+      updateTime();
+      draw();
+      drawTimeline();
+    }, 50);
+  }
+}
+function onSlider() { ti = +document.getElementById('time-slider').value; updateTime(); draw(); drawTimeline(); }
+function updateTime() { document.getElementById('time-display').textContent = 't = ' + (T[ti] || 0).toFixed(1) + 's'; }
+
+// ── 맵 캔버스 ──
+function fit() {
+  const c = document.getElementById('map');
+  const wrap = document.getElementById('canvas-wrap');
+  c.width = wrap.clientWidth;
+  c.height = wrap.clientHeight;
+}
+window.onresize = () => { fit(); draw(); drawTimeline(); };
+
+function draw() {
+  const c = document.getElementById('map'), ctx = c.getContext('2d');
+  if (!c.width) return;
+  const W = 30, H = 25;
+  const s = Math.min(c.width / (W + 2), c.height / (H + 2));
+  const ox = (c.width - W * s) / 2, oy = c.height - (c.height - H * s) / 2;
+  const X = v => ox + v * s, Y = v => oy - v * s;
+
+  ctx.fillStyle = '#0d1117'; ctx.fillRect(0, 0, c.width, c.height);
+
+  // 외곽
+  ctx.strokeStyle = '#30363d'; ctx.lineWidth = 1; ctx.beginPath();
+  ctx.rect(X(0), Y(H), W * s, H * s); ctx.stroke();
+
+  // 게이트 배리어
+  ctx.fillStyle = '#161b22'; ctx.fillRect(X(GX), Y(TY), GL * s, (TY - BY) * s);
+  GY.forEach((gy, i) => {
+    ctx.fillStyle = '#1b4332'; ctx.fillRect(X(GX), Y(gy + PW / 2), GL * s, PW * s);
+    ctx.fillStyle = '#484f58'; ctx.font = Math.max(9, s * 0.3) + 'px sans-serif';
+    ctx.fillText('G' + (i + 1), X(GX + 0.15), Y(gy) + 4);
+  });
+
+  // 계단
+  ctx.fillStyle = '#da3633'; ctx.globalAlpha = 0.1;
+  ctx.fillRect(X(2.5), Y(18), s, 3 * s);
+  ctx.fillRect(X(2.5), Y(11), s, 3 * s);
+  ctx.globalAlpha = 1;
+
+  const t = T[ti] || 0;
+  const cols = { moving: '#58a6ff', queue: '#f0883e', service: '#da3633', passed: '#484f58' };
+
+  // 선택 궤적 (과거=노랑, 미래=회색)
+  if (sel && AG[sel]) {
+    const pts = AG[sel];
+    const past = pts.filter(p => p[0] <= t && p[1] >= 0 && p[1] <= W);
+    const future = pts.filter(p => p[0] > t && p[1] >= 0 && p[1] <= W);
+
+    if (past.length > 1) {
+      ctx.beginPath(); ctx.moveTo(X(past[0][1]), Y(past[0][2]));
+      past.forEach(p => ctx.lineTo(X(p[1]), Y(p[2])));
+      ctx.strokeStyle = '#f0c000'; ctx.lineWidth = 2.5; ctx.globalAlpha = 0.6; ctx.stroke(); ctx.globalAlpha = 1;
+    }
+    if (future.length > 1) {
+      ctx.beginPath(); ctx.moveTo(X(future[0][1]), Y(future[0][2]));
+      future.forEach(p => ctx.lineTo(X(p[1]), Y(p[2])));
+      ctx.strokeStyle = '#484f58'; ctx.lineWidth = 1; ctx.setLineDash([4, 4]); ctx.stroke(); ctx.setLineDash([]);
+    }
+    // 시작점
+    if (pts.length) {
+      ctx.beginPath(); ctx.arc(X(pts[0][1]), Y(pts[0][2]), 5, 0, Math.PI * 2);
+      ctx.fillStyle = '#3fb950'; ctx.fill();
+    }
+  }
+
+  // 모든 에이전트 점
+  for (const [aid, pts] of Object.entries(AG)) {
+    let best = null, bd = 999;
+    for (const p of pts) { const d = Math.abs(p[0] - t); if (d < bd) { bd = d; best = p; } }
+    if (!best || bd > 0.3 || best[1] < 0 || best[1] > W) continue;
+    const isSel = +aid === sel;
+    ctx.beginPath(); ctx.arc(X(best[1]), Y(best[2]), isSel ? 9 : 2.5, 0, Math.PI * 2);
+    ctx.fillStyle = isSel ? '#f0c000' : (cols[best[3]] || '#888');
+    ctx.globalAlpha = isSel ? 1 : 0.4; ctx.fill();
+    if (isSel) { ctx.strokeStyle = '#fff'; ctx.lineWidth = 2; ctx.globalAlpha = 1; ctx.stroke(); }
+    ctx.globalAlpha = 1;
+  }
+
+  // 맵 클릭으로 에이전트 선택
+  c.onclick = (e) => {
+    const rect = c.getBoundingClientRect();
+    const mx = (e.clientX - rect.left) / rect.width * c.width;
+    const my = (e.clientY - rect.top) / rect.height * c.height;
+    let closest = null, dist = 20;
+    for (const [aid, pts] of Object.entries(AG)) {
+      let best = null, bd = 999;
+      for (const p of pts) { const d = Math.abs(p[0] - t); if (d < bd) { bd = d; best = p; } }
+      if (!best || bd > 0.3) continue;
+      const dx = X(best[1]) - mx, dy = Y(best[2]) - my;
+      const d = Math.sqrt(dx * dx + dy * dy);
+      if (d < dist) { dist = d; closest = +aid; }
+    }
+    if (closest !== null) selectAgent(closest);
+  };
+}
+
+// ── 타임라인 (x, y over time + state 색상) ──
+function drawTimeline() {
+  const c = document.getElementById('timeline-canvas');
+  const wrap = c.parentElement;
+  c.width = wrap.clientWidth - 240;
+  c.height = wrap.clientHeight;
+  const ctx = c.getContext('2d');
+  ctx.fillStyle = '#0d1117'; ctx.fillRect(0, 0, c.width, c.height);
+
+  if (!sel || !AG[sel] || AG[sel].length < 2) {
+    ctx.fillStyle = '#484f58'; ctx.font = '13px sans-serif';
+    ctx.fillText('Agent를 선택하세요 (맵 클릭 또는 목록)', 20, c.height / 2);
+    return;
+  }
+
+  const pts = AG[sel];
+  const t0 = pts[0][0], t1 = pts[pts.length - 1][0];
+  const dt = t1 - t0 || 1;
+  const pad = { l: 40, r: 10, t: 20, b: 30 };
+  const w = c.width - pad.l - pad.r, h = c.height - pad.t - pad.b;
+
+  // x, y 범위
+  let xMin = Infinity, xMax = -Infinity, yMin = Infinity, yMax = -Infinity;
+  pts.forEach(p => { xMin = Math.min(xMin, p[1]); xMax = Math.max(xMax, p[1]); yMin = Math.min(yMin, p[2]); yMax = Math.max(yMax, p[2]); });
+  const xRange = xMax - xMin || 1, yRange = yMax - yMin || 1;
+  const valRange = Math.max(xRange, yRange);
+
+  const tX = t => pad.l + (t - t0) / dt * w;
+  const vY = (v, base, range) => pad.t + h - (v - base) / range * h;
+
+  // 상태 배경
+  const stateCols = { moving: '#58a6ff22', queue: '#f0883e22', service: '#da363322' };
+  for (let i = 0; i < pts.length - 1; i++) {
+    const st = pts[i][3];
+    ctx.fillStyle = stateCols[st] || '#00000000';
+    ctx.fillRect(tX(pts[i][0]), pad.t, tX(pts[i + 1][0]) - tX(pts[i][0]), h);
+  }
+
+  // x 곡선 (파랑)
+  ctx.beginPath();
+  pts.forEach((p, i) => { const fn = i ? 'lineTo' : 'moveTo'; ctx[fn](tX(p[0]), vY(p[1], xMin, valRange)); });
+  ctx.strokeStyle = '#58a6ff'; ctx.lineWidth = 1.5; ctx.stroke();
+
+  // y 곡선 (주황)
+  ctx.beginPath();
+  pts.forEach((p, i) => { const fn = i ? 'lineTo' : 'moveTo'; ctx[fn](tX(p[0]), vY(p[2], yMin, valRange)); });
+  ctx.strokeStyle = '#f0883e'; ctx.lineWidth = 1.5; ctx.stroke();
+
+  // 현재 시간 선
+  const curT = T[ti] || 0;
+  if (curT >= t0 && curT <= t1) {
+    ctx.beginPath(); ctx.moveTo(tX(curT), pad.t); ctx.lineTo(tX(curT), pad.t + h);
+    ctx.strokeStyle = '#f0c000'; ctx.lineWidth = 1.5; ctx.setLineDash([4, 4]); ctx.stroke(); ctx.setLineDash([]);
+  }
+
+  // 축 레이블
+  ctx.fillStyle = '#8b949e'; ctx.font = '11px sans-serif';
+  ctx.fillText(t0.toFixed(0) + 's', pad.l, pad.t + h + 15);
+  ctx.fillText(t1.toFixed(0) + 's', pad.l + w - 20, pad.t + h + 15);
+  ctx.fillStyle = '#58a6ff'; ctx.fillText('x', 5, pad.t + 10);
+  ctx.fillStyle = '#f0883e'; ctx.fillText('y', 18, pad.t + 10);
+
+  // 범례
+  ctx.font = '10px sans-serif';
+  const leg = [['moving', '#58a6ff'], ['queue', '#f0883e'], ['service', '#da3633']];
+  leg.forEach(([label, col], i) => {
+    const lx = pad.l + 60 + i * 70;
+    ctx.fillStyle = col; ctx.globalAlpha = 0.3; ctx.fillRect(lx, pad.t + h + 8, 12, 10);
+    ctx.globalAlpha = 1; ctx.fillStyle = '#8b949e'; ctx.fillText(label, lx + 15, pad.t + h + 17);
+  });
+}
+</script>
+</body></html>

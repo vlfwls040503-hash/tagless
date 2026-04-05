@@ -101,11 +101,11 @@ TEMPERAMENTS = {
 TEMPERAMENT_RATIO = [1, 1, 1]
 
 DIST_ESTIMATION_ERROR = 0.10
-CHOICE_DIST_1ST = 9.0   # 계단 직후 선택 (x~3~4에서 발동) -> 처음부터 해당 게이트로 직행
+CHOICE_DIST_1ST = 3.0   # 계단 직후 선택 (x~3~4에서 발동) -> 처음부터 해당 게이트로 직행
 CHOICE_DIST_2ND = 1.7   # 조건부 재선택 (대기열 3명+ 일 때만)
 
 # 대기열 내 재선택 (LRP)
-QUEUE_RESELECT_ENABLED = False  # 대기열 진입 후 게이트 확정
+QUEUE_RESELECT_ENABLED = True   # 큐 내 인접 게이트 조건부 jockeying
 QUEUE_RESELECT_INTERVAL = 1.0   # 재선택 판단 주기 (초)
 QUEUE_RESELECT_MIN_QUEUE = 3    # 현재 큐 최소 인원 (이상일 때만 재선택 고려)
 QUEUE_RESELECT_MIN_DIFF = 2     # 새 큐가 이만큼 짧아야 이동
@@ -285,10 +285,10 @@ def create_simulation():
 
     gate_x_end = GATE_X + GATE_LENGTH
 
-    # 1단계: 접근 Waypoint (게이트 선택 후 도달 -> x=10.0)
+    # 1단계: 접근 Waypoint (게이트 바로 앞 -> x=11.0)
     approach_wp_ids = []
     for g in gates:
-        wp_id = sim.add_waypoint_stage((8.0, g["y"]), 0.5)
+        wp_id = sim.add_waypoint_stage((11.2, g["y"]), 1.0)
         approach_wp_ids.append(wp_id)
 
     # 2단계: 게이트 출구 Waypoint (서비스 완료 후 재투입 지점)
@@ -504,12 +504,12 @@ def run_simulation():
         for gi in range(N_GATES):
             n_q = len(sw_queue[gi])
             if n_q == 0:
-                queue_tail_snap.append(QUEUE_HEAD_X)
+                queue_tail_snap.append(QUEUE_HEAD_X - 2.0)  # 빈 큐: 2m 앞에서 흡수
             else:
                 queue_tail_snap.append(QUEUE_HEAD_X - n_q * QUEUE_SPACING - 0.3)
 
-        # 게이트별로 tail에 가장 가까운 에이전트 1명만 진입 (자연스러운 줄서기)
-        gate_best = [None] * N_GATES  # (aid, px)
+        # queue_tail을 지나친 에이전트 전부 수집 (게이트별, px 내림차순)
+        gate_candidates = [[] for _ in range(N_GATES)]
         for agent in list(sim.agents()):
             aid = agent.id
             if aid not in agent_data:
@@ -522,19 +522,18 @@ def run_simulation():
             if gi < 0:
                 continue
             if px > queue_tail_snap[gi] and len(sw_queue[gi]) < QUEUE_MAX_LENGTH:
-                if gate_best[gi] is None or px > gate_best[gi][1]:
-                    gate_best[gi] = (aid, px)
+                gate_candidates[gi].append((px, aid))
 
         for gi in range(N_GATES):
-            if gate_best[gi] is not None:
-                if current_time - last_queue_entry_time[gi] < QUEUE_ENTRY_MIN_GAP:
-                    continue  # 이전 진입 후 0.5초 안 됨
-                aid = gate_best[gi][0]
+            # gate에 가까운 순서(내림차순)로 전부 흡수
+            gate_candidates[gi].sort(reverse=True)
+            for px_c, aid in gate_candidates[gi]:
                 ad = agent_data[aid]
                 ad["queued"] = True
                 ad["queue_enter_time"] = current_time
                 sw_queue[gi].append(aid)
                 sim.mark_agent_for_removal(aid)
+            if gate_candidates[gi]:
                 last_queue_entry_time[gi] = current_time
 
         # ── 소프트웨어 큐 서비스 처리 ──
@@ -635,6 +634,7 @@ def run_simulation():
                         rng, (qx, gate_y), ad["original_speed"],
                         ad["temperament"], gates, gate_queue_snap, stage="2nd")
                     if (new_gate != gi and
+                            abs(new_gate - gi) <= 1 and          # 인접 게이트만 (jockeying)
                             gate_queue_snap[new_gate] < gate_queue_snap[gi] - QUEUE_RESELECT_MIN_DIFF):
                         sw_queue[gi].remove(qaid)
                         sw_queue[new_gate].append(qaid)
@@ -676,7 +676,10 @@ def run_simulation():
             dist_to_gate = GATE_X - px
 
             # ── Phase 0: Influence Zone 진입 (1차 선택) ──
-            if ad["choice_stage"] == 0 and dist_to_gate <= CHOICE_DIST_1ST:
+            # 선택 거리 = 현재 배정 게이트 큐 tail보다 1.5m 뒤 (동적), 최소 3.0m
+            _cur_gi = ad["gate_idx"] if ad["gate_idx"] >= 0 else 0
+            _dynamic_dist = max(3.0, (GATE_X - queue_tail_snap[_cur_gi]) + 1.5)
+            if ad["choice_stage"] == 0 and dist_to_gate <= _dynamic_dist:
                 gate_idx_new = choose_gate_lrp(
                     rng, (px, py), ad["original_speed"], ad["temperament"],
                     gates, gate_queue, stage="1st")
@@ -708,7 +711,7 @@ def run_simulation():
                         rng, (px, py), ad["original_speed"], ad["temperament"],
                         gates, gate_queue, stage="2nd")
                     if (new_gate != current_gate and
-                            gate_queue[new_gate] < gate_queue[current_gate] - 1):
+                            gate_queue[new_gate] < gate_queue[current_gate] - 2):
                         try:
                             sim.switch_agent_journey(
                                 aid, journey_ids[new_gate],

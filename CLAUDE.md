@@ -12,35 +12,50 @@
 ## 시나리오 설계
 | 독립변수 | 수준 |
 |---|---|
-| 태그리스 이용 비율 | 20 / 40 / 60 / 80% |
-| 전용 게이트 수 | 0(겸용) / 1 / 2 / 3대 |
+| 태그리스 이용 비율 (p) | 0 / 20 / 40 / 60 / 80 / 100% |
+| 전용 게이트 수 (k) | 0 / 1 / 2 / 3대 |
 | 시간대 | 첨두 / 비첨두 |
 
-총 40개 시나리오 + S0(0% 기본), S1(100% 태그리스) 앵커 시나리오
+총 40개 시나리오 + S0(p=0%, 현행), S1(p=100%, 전면 도입) 앵커 시나리오
 
 ## 현재 구현 상태
 - [x] 보행 모델: CFSM V2 (JuPedSim) + 소프트웨어 큐
 - [x] 게이트 선택: Gao et al. (2019) LRP 3단계
 - [x] 물리 기반 도착 모델 (성수역 구조 반영)
+- [x] 동적 waypoint: 큐 깊이별 접근 목표 자동 조정
+- [x] 역행 방지: waypoint 앞 에이전트 즉시 흡수
 - [x] S0 기본 시나리오 (TAGLESS_RATIO=0.0)
 - [x] S1 전면 태그리스 (TAGLESS_RATIO=1.0)
-- [x] 시나리오 비교 분석 (compare_scenarios.py)
+- [x] V&V Phase 1-2 완료 (NIST TN 1822)
 - [ ] 출구 계단 혼잡도 측정 (병목 전이 분석용 모델 확장 필요)
-- [ ] 과도기 시나리오 (20~80% 혼입률 x 전용 게이트 수)
+- [ ] 과도기 시나리오 (20~80% 혼입률 × 전용 게이트 수)
+- [ ] Calibration/Validation (우이신설선 실측 데이터 확보 후)
 
 ## 주요 파일
 ```
 simulation/
   run_west_simulation_cfsm.py   <- 메인 시뮬레이션 (파라미터 여기서 수정)
+  run_demo.py                   <- 데모 버전 (발표용, 파라미터 자유 수정)
   seongsu_west.py               <- 성수역 기하구조 (게이트, 계단, 출구 좌표)
   compare_scenarios.py          <- 시나리오 비교 분석 (병목, 첨두/비첨두)
+  verify_cfsm_basic.py          <- V&V 검증 스크립트
   analyze_trajectories.py       <- 궤적 품질 자동 감지 (역행, 정체, 밀집)
 
 output/
-  baseline/                     <- S0 결과 (TAGLESS_RATIO=0.0)
-  tagless/                      <- S1 결과 (TAGLESS_RATIO=1.0)
-  scenario_comparison.png       <- 두 시나리오 비교 그래프
+  simulation_cfsm.mp4           <- 최신 시뮬레이션 영상
+  demo_baseline.mp4             <- 발표용 데모 영상 (p=0%, 열차 2편, 150명/편)
+
+docs/
+  vv_framework.md               <- V&V 프레임워크 문서
+  졸작6주차_박필진.pdf           <- 6주차 발표자료
+  필요 데이터 연구 계획서.pdf    <- 데이터 협조 요청 계획서
 ```
+
+## 데모 파일 운용 방법
+1. `run_demo.py`는 `run_west_simulation_cfsm.py`의 복사본으로, 파라미터를 자유롭게 수정하여 발표/테스트용 영상 생성
+2. 코드 수정은 `run_west_simulation_cfsm.py`에서 진행
+3. 최종 커밋 확정 시 `cp run_west_simulation_cfsm.py run_demo.py`로 데모 파일 동기화
+4. 데모 파일의 파라미터(SIM_TIME, TRAIN_ALIGHTING, TAGLESS_RATIO 등)만 변경하여 사용
 
 ## 핵심 파라미터 (run_west_simulation_cfsm.py)
 ```python
@@ -51,12 +66,15 @@ SIM_TIME             = 720.0  # 시뮬레이션 시간 (s, 열차 4편)
 TRAIN_INTERVAL       = 180.0  # 열차 간격 (s)
 TRAIN_ALIGHTING      = 234    # 편당 하차인원 (성수역 08-09시 기준)
 N_GATES              = 7      # 게이트 수
+MAX_QUEUE_DEPTH_WP   = 25     # 동적 waypoint 최대 큐 깊이
 ```
 
 ## 시뮬레이션 실행
 ```bash
 cd ~/tagless
-python simulation/run_west_simulation_cfsm.py   # 시뮬레이션 실행
+python simulation/run_west_simulation_cfsm.py   # 메인 시뮬레이션
+python simulation/run_demo.py                    # 데모 시뮬레이션
+python simulation/verify_cfsm_basic.py           # V&V 검증
 python simulation/compare_scenarios.py           # 시나리오 비교 분석
 ```
 

@@ -134,6 +134,7 @@ GATE_ZONE_X_END = GATE_X + GATE_LENGTH + 0.3
 QUEUE_HEAD_X = GATE_X - 0.3   # 큐 head 위치 (게이트 0.3m 앞)
 QUEUE_SPACING = 0.5            # 대기 간격
 QUEUE_MAX_LENGTH = 999         # 큐 제한 없음
+MAX_QUEUE_DEPTH_WP = 25        # 동적 waypoint 최대 큐 깊이
 
 OUTPUT_DIR = pathlib.Path(__file__).parent.parent / "output"
 OUTPUT_DIR.mkdir(exist_ok=True)
@@ -317,11 +318,20 @@ def create_simulation():
 
     gate_x_end = GATE_X + GATE_LENGTH
 
-    # 1단계: 접근 Waypoint (게이트 바로 앞 -> x=11.0)
-    approach_wp_ids = []
+    # 1단계: 접근 Waypoint (큐 깊이별 동적 위치)
+    approach_wp_grid = []  # [gate][depth] -> wp_id
     for g in gates:
-        wp_id = sim.add_waypoint_stage((11.2, g["y"]), 1.0)
-        approach_wp_ids.append(wp_id)
+        gate_wps = []
+        for depth in range(MAX_QUEUE_DEPTH_WP + 1):
+            if depth == 0:
+                wp_x = QUEUE_HEAD_X - 0.8  # 빈 큐: 큐 head 0.8m 뒤에서 감속
+            else:
+                wp_x = QUEUE_HEAD_X - depth * QUEUE_SPACING - 0.8
+            wp_x = max(wp_x, 2.0)
+            wp_id = sim.add_waypoint_stage((wp_x, g["y"]), 0.5)
+            gate_wps.append(wp_id)
+        approach_wp_grid.append(gate_wps)
+    approach_wp_ids = [approach_wp_grid[i][0] for i in range(N_GATES)]
 
     # 2단계: 게이트 출구 Waypoint (서비스 완료 후 재투입 지점)
     post_gate_wp_ids = []
@@ -343,23 +353,26 @@ def create_simulation():
         (EXITS[1]["x_start"], EXITS[1]["y"] + 0.5),
     ]))
 
-    # 접근 Journey: approach_wp -> post_gate_wp -> exit (큐 스테이지 없음)
-    # 에이전트가 approach_wp 도달 후 x>10.5에서 제거되므로,
-    # post_gate 이후 단계는 실제로 사용되지 않지만 journey 구조 유지
-    journey_ids = []
+    # 접근 Journey: 큐 깊이별 동적 waypoint → post_gate → exit
+    journey_grid = []  # [gate][depth] -> journey_id
     for i, g in enumerate(gates):
         target_exit = exit_upper if g["y"] > CONCOURSE_WIDTH / 2 else exit_lower
-        journey = jps.JourneyDescription([
-            approach_wp_ids[i], post_gate_wp_ids[i], exit_upper, exit_lower
-        ])
-        journey.set_transition_for_stage(
-            approach_wp_ids[i],
-            jps.Transition.create_fixed_transition(post_gate_wp_ids[i]))
-        journey.set_transition_for_stage(
-            post_gate_wp_ids[i],
-            jps.Transition.create_fixed_transition(target_exit))
-        jid = sim.add_journey(journey)
-        journey_ids.append(jid)
+        gate_jids = []
+        for depth in range(MAX_QUEUE_DEPTH_WP + 1):
+            wp_id = approach_wp_grid[i][depth]
+            journey = jps.JourneyDescription([
+                wp_id, post_gate_wp_ids[i], exit_upper, exit_lower
+            ])
+            journey.set_transition_for_stage(
+                wp_id,
+                jps.Transition.create_fixed_transition(post_gate_wp_ids[i]))
+            journey.set_transition_for_stage(
+                post_gate_wp_ids[i],
+                jps.Transition.create_fixed_transition(target_exit))
+            jid = sim.add_journey(journey)
+            gate_jids.append(jid)
+        journey_grid.append(gate_jids)
+    journey_ids = [journey_grid[i][0] for i in range(N_GATES)]
 
     # Post-gate only Journey: 재투입 에이전트용 (post_gate_wp -> exit)
     post_journey_ids = []
@@ -379,8 +392,8 @@ def create_simulation():
     default_stage_id = approach_wp_ids[mid_gate]
 
     return (sim, gates, walkable, vis_obstacles, gate_openings,
-            approach_wp_ids, post_gate_wp_ids,
-            journey_ids, post_journey_ids,
+            approach_wp_ids, approach_wp_grid, post_gate_wp_ids,
+            journey_ids, journey_grid, post_journey_ids,
             default_journey_id, default_stage_id,
             exit_upper, exit_lower)
 
@@ -402,8 +415,8 @@ def run_simulation():
     print("=" * 60)
 
     (sim, gates, walkable, obstacles, gate_openings,
-     approach_wp_ids, post_gate_wp_ids,
-     journey_ids, post_journey_ids,
+     approach_wp_ids, approach_wp_grid, post_gate_wp_ids,
+     journey_ids, journey_grid, post_journey_ids,
      default_journey_id, default_stage_id,
      exit_upper, exit_lower) = create_simulation()
 
@@ -484,8 +497,9 @@ def run_simulation():
                         rng, (spawn_x, spawn_y), desired_speed, temperament,
                         gates, gate_queue, stage="1st")
                     choice_stage = 1
-                    jid = journey_ids[gate_idx]
-                    sid = approach_wp_ids[gate_idx]
+                    _depth = min(len(sw_queue[gate_idx]), MAX_QUEUE_DEPTH_WP)
+                    jid = journey_grid[gate_idx][_depth]
+                    sid = approach_wp_grid[gate_idx][_depth]
                 else:
                     gate_idx = -1
                     choice_stage = 0
@@ -515,6 +529,7 @@ def run_simulation():
                         "is_tagless": is_tagless,
                         "temperament": temperament,
                         "choice_stage": choice_stage,
+                        "target_depth": min(len(sw_queue[gate_idx]), MAX_QUEUE_DEPTH_WP) if gate_idx >= 0 else 0,
                     }
                     spawned_count += 1
                     stats["temperament_counts"][temperament] += 1
@@ -536,9 +551,9 @@ def run_simulation():
         for gi in range(N_GATES):
             n_q = len(sw_queue[gi])
             if n_q == 0:
-                queue_tail_snap.append(QUEUE_HEAD_X - 0.5)  # 빈 큐: 0.5m 앞에서 흡수
+                queue_tail_snap.append(QUEUE_HEAD_X - 0.8)  # 빈 큐: 0.8m 뒤에서 흡수
             else:
-                queue_tail_snap.append(QUEUE_HEAD_X - n_q * QUEUE_SPACING - 0.3)
+                queue_tail_snap.append(QUEUE_HEAD_X - n_q * QUEUE_SPACING - 0.8)
 
         # queue_tail을 지나친 에이전트 전부 수집 (게이트별, px 내림차순)
         gate_candidates = [[] for _ in range(N_GATES)]
@@ -697,9 +712,12 @@ def run_simulation():
                     gates, gate_queue, stage="1st")
                 ad["gate_idx"] = gate_idx_new
                 ad["choice_stage"] = 1
+                _depth = min(gate_queue[gate_idx_new], MAX_QUEUE_DEPTH_WP)
+                ad["target_depth"] = _depth
                 try:
                     sim.switch_agent_journey(
-                        aid, journey_ids[gate_idx_new], approach_wp_ids[gate_idx_new])
+                        aid, journey_grid[gate_idx_new][_depth],
+                        approach_wp_grid[gate_idx_new][_depth])
                 except Exception:
                     pass
                 gi = gate_idx_new
@@ -724,16 +742,55 @@ def run_simulation():
                         gates, gate_queue, stage="2nd")
                     if (new_gate != current_gate and
                             gate_queue[new_gate] < gate_queue[current_gate] - 2):
+                        _depth = min(gate_queue[new_gate], MAX_QUEUE_DEPTH_WP)
                         try:
                             sim.switch_agent_journey(
-                                aid, journey_ids[new_gate],
-                                approach_wp_ids[new_gate])
+                                aid, journey_grid[new_gate][_depth],
+                                approach_wp_grid[new_gate][_depth])
                             ad["gate_idx"] = new_gate
+                            ad["target_depth"] = _depth
                             stats["reroute_count"] += 1
                         except Exception:
                             pass
 
             # 3차 재선택 제거: 게이트 1m 앞에서 방향 전환 금지
+
+        # ── 동적 waypoint 업데이트: 큐 깊이 변경 시 접근 목표 전환 ──
+        if step % int(0.5 / DT) == 0:
+            for agent in list(sim.agents()):
+                aid = agent.id
+                if aid not in agent_data:
+                    continue
+                ad = agent_data[aid]
+                if ad["serviced"] or ad.get("queued"):
+                    continue
+                gi = ad["gate_idx"]
+                if gi < 0:
+                    continue
+                new_depth = min(len(sw_queue[gi]), MAX_QUEUE_DEPTH_WP)
+                # 새 waypoint 위치 계산
+                if new_depth == 0:
+                    wp_x = QUEUE_HEAD_X - 0.8
+                else:
+                    wp_x = QUEUE_HEAD_X - new_depth * QUEUE_SPACING - 0.8
+                # 이미 waypoint보다 앞에 있으면 역행 방지 → 즉시 흡수
+                px = agent.position[0]
+                if px > wp_x and len(sw_queue[gi]) < QUEUE_MAX_LENGTH:
+                    if current_time - last_queue_entry_time[gi] >= QUEUE_ENTRY_MIN_GAP or len(sw_queue[gi]) == 0:
+                        ad["queued"] = True
+                        ad["queue_enter_time"] = current_time
+                        sw_queue[gi].append(aid)
+                        sim.mark_agent_for_removal(aid)
+                        last_queue_entry_time[gi] = current_time
+                        continue
+                if new_depth != ad.get("target_depth", 0):
+                    ad["target_depth"] = new_depth
+                    try:
+                        sim.switch_agent_journey(
+                            aid, journey_grid[gi][new_depth],
+                            approach_wp_grid[gi][new_depth])
+                    except Exception:
+                        pass
 
         # ── 궤적 기록 ──
         if step % traj_interval == 0:

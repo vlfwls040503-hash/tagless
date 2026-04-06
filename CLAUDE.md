@@ -26,23 +26,20 @@
 - [x] S1 전면 태그리스 (TAGLESS_RATIO=1.0)
 - [x] 시나리오 비교 분석 (compare_scenarios.py)
 - [ ] 출구 계단 혼잡도 측정 (병목 전이 분석용 모델 확장 필요)
-- [ ] 과도기 시나리오 (20~80% 혼입률 × 전용 게이트 수)
+- [ ] 과도기 시나리오 (20~80% 혼입률 x 전용 게이트 수)
 
 ## 주요 파일
 ```
 simulation/
-  run_west_simulation_cfsm.py   ← 메인 시뮬레이션 (파라미터 여기서 수정)
-  seongsu_west.py               ← 성수역 기하구조 (게이트, 계단, 출구 좌표)
-  compare_scenarios.py          ← 시나리오 비교 분석 (병목, 첨두/비첨두)
-  analyze_trajectories.py       ← 궤적 품질 자동 감지 (역행, 정체, 밀집)
+  run_west_simulation_cfsm.py   <- 메인 시뮬레이션 (파라미터 여기서 수정)
+  seongsu_west.py               <- 성수역 기하구조 (게이트, 계단, 출구 좌표)
+  compare_scenarios.py          <- 시나리오 비교 분석 (병목, 첨두/비첨두)
+  analyze_trajectories.py       <- 궤적 품질 자동 감지 (역행, 정체, 밀집)
 
 output/
-  baseline/                     ← S0 결과 (TAGLESS_RATIO=0.0)
-  tagless/                      ← S1 결과 (TAGLESS_RATIO=1.0)
-  scenario_comparison.png       ← 두 시나리오 비교 그래프
-
-data/
-  서울교통공사_역별 시간대별 승하차인원(24.1~24.12).csv
+  baseline/                     <- S0 결과 (TAGLESS_RATIO=0.0)
+  tagless/                      <- S1 결과 (TAGLESS_RATIO=1.0)
+  scenario_comparison.png       <- 두 시나리오 비교 그래프
 ```
 
 ## 핵심 파라미터 (run_west_simulation_cfsm.py)
@@ -70,13 +67,11 @@ python simulation/compare_scenarios.py           # 시나리오 비교 분석
 | 추정 총 통행시간 | 41.4s | 32.9s | -20.6% |
 | 총 통행비용 | 11.17 인시 | 8.86 인시 | -20.6% |
 
-**병목 분석**: 기본→게이트 병목(3.5 ped/s < 계단 4.6 ped/s), 태그리스→계단 병목(5.8 > 4.6)
+**병목 분석**: 기본 -> 게이트 병목(3.5 ped/s < 계단 4.6 ped/s), 태그리스 -> 계단 병목(5.8 > 4.6)
 
 ## 의존 패키지
 ```
-jupedsim
-numpy, matplotlib, shapely, pandas
-imageio-ffmpeg
+jupedsim, numpy, matplotlib, shapely, pandas, imageio-ffmpeg
 ```
 
 ## Git 설정

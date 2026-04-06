@@ -1011,7 +1011,8 @@ def create_mp4(frames, gates, obstacles, gate_openings):
     mp4_path = OUTPUT_DIR / "simulation_cfsm.mp4"
     ffmpeg_path = imageio_ffmpeg.get_ffmpeg_exe()
     plt.rcParams['animation.ffmpeg_path'] = ffmpeg_path
-    writer = FFMpegWriter(fps=10, bitrate=2000)
+    writer = FFMpegWriter(fps=10, bitrate=2000,
+                          extra_args=['-movflags', '+faststart', '-pix_fmt', 'yuv420p'])
     anim.save(str(mp4_path), writer=writer, dpi=120)
     plt.close(fig)
     print(f"  MP4: {mp4_path}")

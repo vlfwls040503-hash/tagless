@@ -55,7 +55,15 @@ DT = 0.05
 # =============================================================================
 TRAIN_INTERVAL = 180.0
 TRAIN_ALIGHTING = 234  # 08-09시 평일 평균 (11,214명/h ÷ 24편 × 서쪽50%)
-PLATOON_SPREAD = 50.0  # 플랫폼 하차 → 계단 도달 시간차 (열차 길이 ~200m)
+PLATOON_SPREAD = 50.0  # (미사용, 물리 기반으로 대체)
+
+# 성수역 물리 기반 도착 모델 파라미터
+PLATFORM_LENGTH = 105.0       # 승강장 길이 (m)
+ALIGHTING_DELAY_MAX = 10.0    # 하차 지연 최대 (s)
+STAIR_DESCENT_TIME = 12.0     # 계단 하행 시간 (s) — ~10m, 0.85m/s
+STAIR_TO_GATE_DIST = 11.0     # 계단 하부 → 게이트 구간 거리 (m)
+WALK_SPEED_MEAN = 1.34        # 플랫폼 보행속도 평균 (m/s)
+WALK_SPEED_STD = 0.26         # 플랫폼 보행속도 표준편차 (m/s)
 FIRST_TRAIN_TIME = 5.0
 
 # 계단 방출율 (Weidmann 1993: 1.25명/s/m, 하행)
@@ -74,8 +82,15 @@ PED_SPEED_MAX = 1.5
 # =============================================================================
 # CFSM V2 에이전트 파라미터 (Tordeux et al., 2016)
 # =============================================================================
-CFSM_TIME_GAP = 0.80      # 시간 간격 (s)
+CFSM_TIME_GAP = 0.80      # 시간 간격 (s) — 기본값 (밀도 기반 동적 조정)
 CFSM_RADIUS = 0.15        # 보행자 반경 (m)
+
+# 밀도 기반 동적 time_gap 파라미터
+DYNAMIC_TIME_GAP = True
+TIME_GAP_LOW  = 1.5    # 저밀도 (< 0.5 ped/m²): 넓은 간격
+TIME_GAP_MID  = 1.0    # 중밀도 (0.5~1.5 ped/m²)
+TIME_GAP_HIGH = 0.7    # 고밀도 (> 1.5 ped/m²): 촘촘한 간격
+DENSITY_R = 2.0         # 밀도 측정 반경 (m)
 
 # =============================================================================
 # 서비스 시간 파라미터 (Gao et al., 2019)
@@ -128,10 +143,12 @@ OUTPUT_DIR.mkdir(exist_ok=True)
 # 유틸 함수
 # =============================================================================
 def generate_arrival_schedule(rng, sim_time):
-    """열차별 계단 1개만 사용하는 도착 스케줄.
-    성수역 섬식 승강장: 내선(상행)→lower계단(idx=1), 외선(하행)→upper계단(idx=0)
-    열차가 교대로 도착하므로 계단도 교대.
-    방출율 제약: Fruin LOS E 기준.
+    """물리 기반 도착 스케줄 (성수역 구조 반영).
+
+    도착시간 = 열차도착 + 하차지연 + 승강장보행 + 계단하행 + 계단→게이트 보행
+    - 계단이 승강장 양 끝에 위치 → 가까운 쪽 계단으로 이동
+    - 승객 위치: 열차 전체에 균등 분포
+    - 열차가 교대로 도착하므로 계단도 교대.
     """
     min_gap = 1.0 / STAIR_CAPACITY
 
@@ -145,11 +162,28 @@ def generate_arrival_schedule(rng, sim_time):
 
         times = []
         for _ in range(n_passengers):
-            raw_t = train_time + abs(rng.normal(PLATOON_SPREAD / 2, PLATOON_SPREAD / 4))
+            # 1. 열차 내 위치 (균등분포, 0 = 계단 쪽 끝)
+            pos_on_platform = rng.uniform(0, PLATFORM_LENGTH)
+
+            # 2. 가까운 쪽 계단까지 거리 (양 끝에 계단)
+            dist_to_stair = min(pos_on_platform, PLATFORM_LENGTH - pos_on_platform)
+
+            # 3. 개인별 보행속도
+            walk_speed = max(0.8, rng.normal(WALK_SPEED_MEAN, WALK_SPEED_STD))
+
+            # 4. 하차 지연 (문 앞=0, 안쪽=최대 10초)
+            alighting_delay = rng.uniform(0, ALIGHTING_DELAY_MAX)
+
+            # 5. 총 도착시간
+            t_platform_walk = dist_to_stair / walk_speed
+            t_stair_descent = STAIR_DESCENT_TIME
+            t_stair_to_gate = STAIR_TO_GATE_DIST / walk_speed
+            raw_t = train_time + alighting_delay + t_platform_walk + t_stair_descent + t_stair_to_gate
+
             times.append(raw_t)
         times.sort()
 
-        # 방출율 제약
+        # 방출율 제약 (계단 용량)
         for j in range(1, len(times)):
             earliest = times[j - 1] + min_gap
             if times[j] < earliest:
@@ -525,15 +559,16 @@ def run_simulation():
                 gate_candidates[gi].append((px, aid))
 
         for gi in range(N_GATES):
-            # gate에 가까운 순서(내림차순)로 전부 흡수
             gate_candidates[gi].sort(reverse=True)
             for px_c, aid in gate_candidates[gi]:
+                # 시간 기반 제한: 빈 큐면 즉시, 아니면 0.5초 간격
+                if len(sw_queue[gi]) > 0 and current_time - last_queue_entry_time[gi] < QUEUE_ENTRY_MIN_GAP:
+                    break
                 ad = agent_data[aid]
                 ad["queued"] = True
                 ad["queue_enter_time"] = current_time
                 sw_queue[gi].append(aid)
                 sim.mark_agent_for_removal(aid)
-            if gate_candidates[gi]:
                 last_queue_entry_time[gi] = current_time
 
         # ── 소프트웨어 큐 서비스 처리 ──
@@ -621,8 +656,12 @@ def run_simulation():
                 if gate_queue_snap[gi] < QUEUE_RESELECT_MIN_QUEUE:
                     continue
                 # head(서비스 직전)는 제외, 뒤에서부터 검토
+                # 게이트당 1명만 이동 (동시 대량 이탈 방지)
+                moved = False
                 candidates = list(sw_queue[gi][1:])
                 for qaid in candidates:
+                    if moved:
+                        break
                     ad = agent_data.get(qaid)
                     if not ad:
                         continue
@@ -643,6 +682,7 @@ def run_simulation():
                         # 스냅샷 업데이트
                         gate_queue_snap[gi] -= 1
                         gate_queue_snap[new_gate] += 1
+                        moved = True
 
         # ── 게이트 점유 상태 (재선택용) ──
         gate_occupied = [gate_service[gi] is not None for gi in range(N_GATES)]
@@ -765,6 +805,39 @@ def run_simulation():
                     frame_data.append((GATE_X - 0.1, gate_y, "service"))
 
             video_frames.append((current_time, frame_data))
+
+        # ── 밀도 기반 동적 time_gap 조정 ──
+        if DYNAMIC_TIME_GAP and step % 10 == 0:  # 매 10스텝 (0.5초)
+            positions = []
+            agent_ids_live = []
+            for agent in sim.agents():
+                positions.append(agent.position)
+                agent_ids_live.append(agent.id)
+            if positions:
+                pos_arr = np.array(positions)
+                for k, aid in enumerate(agent_ids_live):
+                    px, py = pos_arr[k]
+                    # 반경 내 이웃 수로 국소 밀도 계산
+                    diffs = pos_arr - pos_arr[k]
+                    dists = np.sqrt(diffs[:, 0]**2 + diffs[:, 1]**2)
+                    n_neighbors = np.sum(dists < DENSITY_R) - 1  # 자기 제외
+                    local_density = n_neighbors / (np.pi * DENSITY_R**2)
+
+                    if local_density < 0.5:
+                        new_tg = TIME_GAP_LOW
+                    elif local_density < 1.5:
+                        # 선형 보간
+                        t = (local_density - 0.5) / 1.0
+                        new_tg = TIME_GAP_LOW + t * (TIME_GAP_MID - TIME_GAP_LOW)
+                    else:
+                        t = min((local_density - 1.5) / 1.0, 1.0)
+                        new_tg = TIME_GAP_MID + t * (TIME_GAP_HIGH - TIME_GAP_MID)
+
+                    try:
+                        agent = sim.agent(aid)
+                        agent.model.time_gap = new_tg
+                    except Exception:
+                        pass
 
         sim.iterate()
 

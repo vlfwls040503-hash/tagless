@@ -274,10 +274,8 @@ def choose_gate_lrp(rng, agent_pos, agent_speed, temperament, gates,
                 return candidates[0][1]
         return current_gate_idx if current_gate_idx is not None else 0
 
-    # y거리 가중치: 횡단(y이동)은 직진(x이동)보다 심리적 비용이 큼
-    Y_WEIGHT = 2.5
     l1_actual = np.array([
-        np.hypot(agent_pos[0] - g["x"], (agent_pos[1] - g["y"]) * Y_WEIGHT)
+        np.hypot(agent_pos[0] - g["x"], agent_pos[1] - g["y"])
         for g in gates
     ])
     l1_est = estimate_distances_with_order_preservation(rng, l1_actual)

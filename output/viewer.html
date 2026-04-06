@@ -1,152 +1,190 @@
 <!DOCTYPE html>
-<html><head><meta charset="UTF-8"><title>성수역 시뮬레이션 뷰어</title></head>
-<body style="margin:0;background:#111;color:#eee;font-family:sans-serif">
-<div style="padding:8px;background:#222;display:flex;gap:8px;align-items:center">
-  <button onclick="togglePlay()" id="pb" style="padding:6px 14px;font-size:16px;cursor:pointer">▶</button>
-  <button onclick="randAgent()" style="padding:6px 10px;cursor:pointer">🎲 랜덤</button>
-  <button onclick="randVib()" style="padding:6px 10px;cursor:pointer;color:#ff6b6b">🎲 진동</button>
-  <input type="range" id="sl" style="flex:1" min="0" max="0" value="0" oninput="manual()">
-  <span id="td" style="min-width:80px;font-size:14px">t=0s</span>
-  <span id="ag" style="min-width:150px;font-size:12px;color:#888"></span>
+<html><head><meta charset="UTF-8"><title>성수역 궤적 뷰어</title></head>
+<body style="margin:0;background:#111;color:#eee;font-family:'Malgun Gothic',sans-serif;overflow:hidden">
+
+<div id="ui" style="position:fixed;top:0;left:0;right:0;padding:8px 12px;background:rgba(0,0,0,0.85);z-index:10;display:flex;gap:8px;align-items:center;flex-wrap:wrap">
+  <button onclick="tp()" id="pb" style="padding:5px 12px;cursor:pointer;font-size:15px">▶ 재생</button>
+  <button onclick="ra()" style="padding:5px 10px;cursor:pointer">🎲 랜덤</button>
+  <button onclick="rv()" style="padding:5px 10px;cursor:pointer;color:#ff6b6b">⚠ 진동</button>
+  <button onclick="sel=null;dr()" style="padding:5px 10px;cursor:pointer;color:#888">✕ 해제</button>
+  <input type="range" id="sl" style="flex:1;min-width:150px" min="0" max="0" value="0" oninput="mn()">
+  <b id="td" style="min-width:70px">t=0s</b>
+  <span id="inf" style="font-size:12px;color:#aaa;min-width:200px"></span>
 </div>
-<canvas id="c"></canvas>
+
+<canvas id="c" style="display:block;margin-top:42px"></canvas>
+
 <script>
-const W=30,H=25,GX=12,GL=1.5,PW=.55,HW=.3,N=7,BY=3,TY=22;
-const ch=N*PW+(N+1)*HW,cb=(BY+TY)/2-ch/2;
-const GY=[];for(let i=0;i<N;i++)GY.push(cb+HW+i*(PW+HW)+PW/2);
+let AG={},ST=[],T=[],sel=null,ti=0,run=false,iv,ks;
 
-let AG={},ST=[],T=[],sel=null,ti=0,run=false,iv,keys;
-
-fetch('traj_by_agent.json').then(r=>r.json()).then(ag=>{
-  AG=ag;keys=Object.keys(AG).map(Number);
+async function init(){
+  AG=await(await fetch('traj_by_agent.json')).json();
+  ST=await(await fetch('traj_stats.json')).json();
+  ks=Object.keys(AG).map(Number);
   const ts=new Set();
-  Object.values(AG).forEach(pts=>pts.forEach(p=>ts.add(p[0])));
+  for(const pts of Object.values(AG)) for(const p of pts) ts.add(p[0]);
   T=[...ts].sort((a,b)=>a-b);
   document.getElementById('sl').max=T.length-1;
-  return fetch('traj_stats.json');
-}).then(r=>r.json()).then(st=>{
-  ST=st;
-  fit();draw();
-});
-
-function fit(){
-  const c=document.getElementById('c');
-  c.width=innerWidth;
-  c.height=innerHeight-44;
+  sz();dr();
 }
-window.onresize=()=>{fit();draw();}
 
-function togglePlay(){
-  if(run){clearInterval(iv);run=false;document.getElementById('pb').textContent='▶';}
-  else{run=true;document.getElementById('pb').textContent='⏸';
+function sz(){const c=document.getElementById('c');c.width=innerWidth;c.height=innerHeight-42;}
+window.onresize=()=>{sz();dr();}
+
+function mn(){ti=+document.getElementById('sl').value;document.getElementById('td').textContent='t='+T[ti]+'s';dr();}
+function tp(){
+  if(run){clearInterval(iv);run=false;document.getElementById('pb').textContent='▶ 재생';}
+  else{run=true;document.getElementById('pb').textContent='⏸ 정지';
     iv=setInterval(()=>{
-      ti++;if(ti>=T.length){ti=0;if(sel)randAgent();}
+      ti+=2;
+      if(ti>=T.length)ti=0;
       document.getElementById('sl').value=ti;
       document.getElementById('td').textContent='t='+T[ti]+'s';
-      draw();
-    },60);
+      dr();
+      // 선택 에이전트 끝나면 자동 랜덤
+      if(sel&&AG[sel]){const pts=AG[sel];if(pts.length&&T[ti]>pts[pts.length-1][0]+3)ra();}
+    },50);
   }
 }
-function manual(){ti=+document.getElementById('sl').value;document.getElementById('td').textContent='t='+T[ti]+'s';draw();}
 
-function randAgent(){
-  // moving 궤적이 20개 이상이고 진동 적은 정상 에이전트만
-  const normal=ST.filter(s=>s[1]<20 && AG[s[0]] && AG[s[0]].filter(p=>p[3]==='moving').length>=20);
-  if(!normal.length)return;
-  const s=normal[Math.floor(Math.random()*normal.length)];
-  pickAgent(s[0]);
+function ra(){
+  // moving 궤적 충분한 정상 에이전트
+  const ok=ST.filter(s=>s[1]<20&&AG[s[0]]&&AG[s[0]].length>=15);
+  if(!ok.length)return;
+  pk(ok[Math.floor(Math.random()*ok.length)][0]);
 }
-function randVib(){
-  const vibs=ST.filter(s=>s[1]>=20 && AG[s[0]] && AG[s[0]].filter(p=>p[3]==='moving').length>=20);
-  if(!vibs.length)return;
-  const s=vibs[Math.floor(Math.random()*vibs.length)];
-  pickAgent(s[0]);
+function rv(){
+  const vb=ST.filter(s=>s[1]>=20&&AG[s[0]]&&AG[s[0]].length>=15);
+  if(!vb.length)return;
+  pk(vb[Math.floor(Math.random()*vb.length)][0]);
 }
-function pickAgent(aid){
+function pk(aid){
   sel=aid;
   const pts=AG[aid];
   if(pts&&pts.length){
     const idx=T.findIndex(t=>t>=pts[0][0]);
-    if(idx>=0){ti=Math.max(0,idx-5);document.getElementById('sl').value=ti;}
+    if(idx>=0){ti=Math.max(0,idx-3);document.getElementById('sl').value=ti;}
   }
   const s=ST.find(x=>x[0]===aid);
-  document.getElementById('ag').textContent=
-    `ID${aid} G${s?s[3]+1:'?'} | 전환${s?s[1]:'-'}회 | 체류${s?s[2]:'-'}s`;
-  if(!run){document.getElementById('td').textContent='t='+T[ti]+'s';draw();}
+  document.getElementById('inf').textContent=
+    `ID${aid} | G${s?s[3]+1:'?'} | 전환 ${s?s[1]:'-'}회 | 체류 ${s?s[2]:'-'}s | ${s?s[4]:'-'}s`;
+  if(!run){document.getElementById('td').textContent='t='+T[ti]+'s';dr();}
 }
 
-function draw(){
+// 캔버스 클릭으로 에이전트 선택
+document.addEventListener('click',function(e){
+  const c=document.getElementById('c');
+  if(e.target!==c)return;
+  const rect=c.getBoundingClientRect();
+  const mx=e.clientX-rect.left, my=e.clientY-rect.top;
+  const s=Math.min(c.width/32,c.height/27);
+  const ox=(c.width-30*s)/2, oy=c.height-(c.height-25*s)/2;
+  // 클릭 좌표 → 시뮬레이션 좌표
+  const sx=(mx-ox)/s, sy=(oy-my)/s;
+  const t=T[ti]||0;
+  let best=null,bd=2;
+  for(const[aid,pts]of Object.entries(AG)){
+    for(const p of pts){
+      if(Math.abs(p[0]-t)>0.3)continue;
+      const d=Math.hypot(p[1]-sx,p[2]-sy);
+      if(d<bd){bd=d;best=+aid;}
+    }
+  }
+  if(best)pk(best);
+});
+
+function dr(){
   const c=document.getElementById('c'),x=c.getContext('2d');
-  if(!c.width)return;
-  const s=Math.min(c.width/(W+2),c.height/(H+2));
-  const ox=(c.width-W*s)/2,oy=c.height-(c.height-H*s)/2;
+  if(!c.width||!T.length)return;
+  const VW=30,VH=25;
+  const s=Math.min(c.width/(VW+2),c.height/(VH+2));
+  const ox=(c.width-VW*s)/2,oy=c.height-(c.height-VH*s)/2;
   const X=v=>ox+v*s,Y=v=>oy-v*s;
 
   x.fillStyle='#111';x.fillRect(0,0,c.width,c.height);
 
   // 외곽
   x.strokeStyle='#333';x.lineWidth=1;x.beginPath();
-  x.moveTo(X(0),Y(0));x.lineTo(X(W),Y(0));x.lineTo(X(W),Y(25));
-  x.lineTo(X(12),Y(25));x.lineTo(X(12),Y(22));x.lineTo(X(0),Y(22));
-  x.closePath();x.stroke();
+  x.moveTo(X(0),Y(0));x.lineTo(X(VW),Y(0));x.lineTo(X(VW),Y(25));
+  x.lineTo(X(12),Y(25));x.lineTo(X(12),Y(22));x.lineTo(X(0),Y(22));x.closePath();x.stroke();
 
-  // 배리어
+  // 게이트
+  const GX=12,GL=1.5,PW=.55,HW=.3,BY=3,TY=22,N=7;
+  const ch=N*PW+(N+1)*HW,cb=(BY+TY)/2-ch/2;
   x.fillStyle='#1a1a2e';x.fillRect(X(GX),Y(TY),GL*s,(TY-BY)*s);
-  GY.forEach((gy,i)=>{
+  for(let i=0;i<N;i++){
+    const gy=cb+HW+i*(PW+HW)+PW/2;
     x.fillStyle='#1b4332';x.fillRect(X(GX),Y(gy+PW/2),GL*s,PW*s);
     x.fillStyle='#555';x.font=Math.max(9,s*.3)+'px sans-serif';
     x.fillText('G'+(i+1),X(GX+.15),Y(gy)+3);
-  });
+  }
 
   // 계단
   x.fillStyle='#e94560';x.globalAlpha=.15;
-  x.fillRect(X(2.5),Y(18),s,3*s);x.fillRect(X(2.5),Y(11),s,3*s);
-  x.globalAlpha=1;
+  x.fillRect(X(2.5),Y(18),s,3*s);x.fillRect(X(2.5),Y(11),s,3*s);x.globalAlpha=1;
+  x.fillStyle='#e94560';x.font='10px sans-serif';
+  x.fillText('upper',X(0.5),Y(16.5)+3);x.fillText('lower',X(0.5),Y(9.5)+3);
 
   const t=T[ti]||0;
   const col={moving:'#4fc3f7',queue:'#EF6C00',service:'#C62828',passed:'#444'};
-  let cnt=0;
 
-  // 선택 궤적
+  // 선택 에이전트 궤적 (먼저 그려서 점 아래에)
   if(sel&&AG[sel]){
     const pts=AG[sel];
-    const past=pts.filter(p=>p[0]<=t&&p[1]>=0&&p[1]<=W);
-    const future=pts.filter(p=>p[0]>t&&p[1]>=0&&p[1]<=W);
+    // 미래 (회색 점선)
+    const fut=pts.filter(p=>p[0]>t&&p[1]>=0&&p[1]<=VW);
+    if(fut.length>1){
+      x.beginPath();x.moveTo(X(fut[0][1]),Y(fut[0][2]));
+      fut.forEach(p=>x.lineTo(X(p[1]),Y(p[2])));
+      x.strokeStyle='#444';x.lineWidth=1;x.setLineDash([3,3]);x.stroke();x.setLineDash([]);
+    }
+    // 과거 (노랑)
+    const past=pts.filter(p=>p[0]<=t&&p[1]>=0&&p[1]<=VW);
     if(past.length>1){
       x.beginPath();x.moveTo(X(past[0][1]),Y(past[0][2]));
       past.forEach(p=>x.lineTo(X(p[1]),Y(p[2])));
-      x.strokeStyle='#ffeb3b';x.lineWidth=2.5;x.globalAlpha=.5;x.stroke();x.globalAlpha=1;
-    }
-    if(future.length>1){
-      x.beginPath();x.moveTo(X(future[0][1]),Y(future[0][2]));
-      future.forEach(p=>x.lineTo(X(p[1]),Y(p[2])));
-      x.strokeStyle='#555';x.lineWidth=1;x.setLineDash([3,3]);x.stroke();x.setLineDash([]);
+      x.strokeStyle='#ffeb3b';x.lineWidth=2.5;x.globalAlpha=.6;x.stroke();x.globalAlpha=1;
     }
     // 시작점
-    if(pts.length){{x.beginPath();x.arc(X(pts[0][1]),Y(pts[0][2]),5,0,Math.PI*2);x.fillStyle='#00e676';x.fill();}}
+    if(pts.length){x.beginPath();x.arc(X(pts[0][1]),Y(pts[0][2]),5,0,Math.PI*2);x.fillStyle='#00e676';x.fill();}
   }
 
-  // 에이전트 점
+  // 모든 에이전트 점
+  let cnt=0;
   for(const[aid,pts]of Object.entries(AG)){
-    let best=null,bd=999;
-    for(const p of pts){const d=Math.abs(p[0]-t);if(d<bd){bd=d;best=p;}}
-    if(!best||bd>.3||best[1]<0||best[1]>W)continue;
+    // 이진 탐색으로 가장 가까운 시점 찾기
+    let lo=0,hi=pts.length-1,best=-1,bd=999;
+    while(lo<=hi){
+      const mid=(lo+hi)>>1;
+      const d=Math.abs(pts[mid][0]-t);
+      if(d<bd){bd=d;best=mid;}
+      if(pts[mid][0]<t)lo=mid+1;else hi=mid-1;
+    }
+    if(best<0||bd>0.3)continue;
+    const p=pts[best];
+    if(p[1]<0||p[1]>VW)continue;
     cnt++;
     const isSel=+aid===sel;
-    x.beginPath();x.arc(X(best[1]),Y(best[2]),isSel?8:3,0,Math.PI*2);
-    x.fillStyle=isSel?'#ffeb3b':(col[best[3]]||'#888');
-    x.globalAlpha=isSel?1:.5;x.fill();
+    x.beginPath();x.arc(X(p[1]),Y(p[2]),isSel?8:3,0,Math.PI*2);
+    x.fillStyle=isSel?'#ffeb3b':(col[p[3]]||'#888');
+    x.globalAlpha=isSel?1:.55;x.fill();
     if(isSel){x.strokeStyle='#fff';x.lineWidth=2;x.globalAlpha=1;x.stroke();}
     x.globalAlpha=1;
   }
 
+  // HUD
   x.fillStyle='#fff';x.font='bold 13px sans-serif';
-  x.fillText('t='+t+'s | '+cnt+'명',8,16);
+  x.fillText('t='+t.toFixed(1)+'s | '+cnt+'명',8,16);
 
-  // 선택 에이전트가 끝나면 자동 랜덤
-  if(sel&&AG[sel]){
-    const pts=AG[sel];
-    if(pts.length&&t>pts[pts.length-1][0]+2&&run) randAgent();
-  }
+  // 범례
+  let lx=8,ly=c.height-12;
+  [['이동','#4fc3f7'],['대기열','#EF6C00'],['서비스','#C62828'],['선택','#ffeb3b']].forEach(([n,co])=>{
+    x.fillStyle=co;x.beginPath();x.arc(lx+5,ly-3,4,0,Math.PI*2);x.fill();
+    x.fillStyle='#999';x.font='11px sans-serif';x.fillText(n,lx+13,ly);
+    lx+=65;
+  });
 }
-</script></body></html>
+
+init();
+</script>
+</body></html>

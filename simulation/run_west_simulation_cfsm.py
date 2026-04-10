@@ -135,6 +135,16 @@ QUEUE_HEAD_X = GATE_X - 0.3   # 큐 head 위치 (게이트 0.3m 앞)
 QUEUE_SPACING = 0.5            # 대기 간격
 QUEUE_MAX_LENGTH = 999         # 큐 제한 없음
 MAX_QUEUE_DEPTH_WP = 25        # 동적 waypoint 최대 큐 깊이
+QUEUE_SHIFT_DURATION = 0.5     # 큐 시프트 모션 시간 (s) — head pop 시 보간
+
+
+def ease_in_out(t):
+    """t in [0,1] -> smoothstep"""
+    if t <= 0:
+        return 0.0
+    if t >= 1:
+        return 1.0
+    return t * t * (3 - 2 * t)
 
 OUTPUT_DIR = pathlib.Path(__file__).parent.parent / "output"
 OUTPUT_DIR.mkdir(exist_ok=True)
@@ -581,6 +591,13 @@ def run_simulation():
                 ad["queued"] = True
                 ad["queue_enter_time"] = current_time
                 sw_queue[gi].append(aid)
+                # 큐 시프트 모션: 진입 슬롯 위치로 visual_x 초기화
+                _slot = len(sw_queue[gi]) - 1
+                _qx = QUEUE_HEAD_X - _slot * QUEUE_SPACING
+                ad["queue_visual_x"] = _qx
+                ad["queue_target_x"] = _qx
+                ad["queue_shift_from"] = _qx
+                ad["queue_shift_start"] = None
                 sim.mark_agent_for_removal(aid)
                 last_queue_entry_time[gi] = current_time
 
@@ -635,6 +652,16 @@ def run_simulation():
                     "start": current_time,
                     "duration": ad["service_time"],
                 }
+                # 큐 시프트 모션: 남은 사람들의 타깃을 한 칸씩 앞으로
+                for _j, _qaid in enumerate(sw_queue[gi]):
+                    _qad = agent_data.get(_qaid)
+                    if _qad is None:
+                        continue
+                    _new_target = QUEUE_HEAD_X - _j * QUEUE_SPACING
+                    if abs(_new_target - _qad.get("queue_target_x", _new_target)) > 1e-6:
+                        _qad["queue_shift_from"] = _qad.get("queue_visual_x", _new_target)
+                        _qad["queue_target_x"] = _new_target
+                        _qad["queue_shift_start"] = current_time
 
         # ── 대기열 내 LRP 재선택 ──
         if QUEUE_RESELECT_ENABLED and step % int(QUEUE_RESELECT_INTERVAL / DT) == 0:
@@ -666,6 +693,22 @@ def run_simulation():
                         sw_queue[new_gate].append(qaid)
                         ad["gate_idx"] = new_gate
                         stats["reroute_count"] += 1
+                        # 큐 시프트 모션: 떠나는 게이트의 잔류 인원 앞당김
+                        for _j, _qaid in enumerate(sw_queue[gi]):
+                            _qad = agent_data.get(_qaid)
+                            if _qad is None:
+                                continue
+                            _new_target = QUEUE_HEAD_X - _j * QUEUE_SPACING
+                            if abs(_new_target - _qad.get("queue_target_x", _new_target)) > 1e-6:
+                                _qad["queue_shift_from"] = _qad.get("queue_visual_x", _new_target)
+                                _qad["queue_target_x"] = _new_target
+                                _qad["queue_shift_start"] = current_time
+                        # 옮긴 본인: 새 게이트의 마지막 슬롯으로 ease 시작
+                        _new_slot = len(sw_queue[new_gate]) - 1
+                        _new_target = QUEUE_HEAD_X - _new_slot * QUEUE_SPACING
+                        ad["queue_shift_from"] = ad.get("queue_visual_x", _new_target)
+                        ad["queue_target_x"] = _new_target
+                        ad["queue_shift_start"] = current_time
                         # 스냅샷 업데이트
                         gate_queue_snap[gi] -= 1
                         gate_queue_snap[new_gate] += 1
@@ -780,10 +823,19 @@ def run_simulation():
                         ad["queued"] = True
                         ad["queue_enter_time"] = current_time
                         sw_queue[gi].append(aid)
+                        # 큐 시프트 모션 초기화
+                        _slot = len(sw_queue[gi]) - 1
+                        _qx = QUEUE_HEAD_X - _slot * QUEUE_SPACING
+                        ad["queue_visual_x"] = _qx
+                        ad["queue_target_x"] = _qx
+                        ad["queue_shift_from"] = _qx
+                        ad["queue_shift_start"] = None
                         sim.mark_agent_for_removal(aid)
                         last_queue_entry_time[gi] = current_time
                         continue
-                if new_depth != ad.get("target_depth", 0):
+                # 역행 방지: depth는 줄어드는 것만 허용 (큐 줄면 앞으로, 큐 늘어도 후퇴 X)
+                cur_depth = ad.get("target_depth", new_depth)
+                if new_depth < cur_depth:
                     ad["target_depth"] = new_depth
                     try:
                         sim.switch_agent_journey(
@@ -791,6 +843,24 @@ def run_simulation():
                             approach_wp_grid[gi][new_depth])
                     except Exception:
                         pass
+
+        # ── 큐 시프트 visual_x 갱신 (ease-in-out) ──
+        for gi in range(N_GATES):
+            for qaid in sw_queue[gi]:
+                ad = agent_data.get(qaid)
+                if ad is None or ad.get("queue_shift_start") is None:
+                    continue
+                elapsed = current_time - ad["queue_shift_start"]
+                if elapsed >= QUEUE_SHIFT_DURATION:
+                    ad["queue_visual_x"] = ad["queue_target_x"]
+                    ad["queue_shift_start"] = None
+                else:
+                    t = elapsed / QUEUE_SHIFT_DURATION
+                    eased = ease_in_out(t)
+                    ad["queue_visual_x"] = (
+                        ad["queue_shift_from"]
+                        + (ad["queue_target_x"] - ad["queue_shift_from"]) * eased
+                    )
 
         # ── 궤적 기록 ──
         if step % traj_interval == 0:
@@ -803,11 +873,12 @@ def run_simulation():
                 state = "passed" if ad.get("serviced") else "moving"
                 trajectory_data.append((current_time, aid, px, py, gi, state))
 
-            # 소프트웨어 큐 내 에이전트 (수학적 위치)
+            # 소프트웨어 큐 내 에이전트 (시각화 위치 = visual_x)
             for gi in range(N_GATES):
                 gate_y = gates[gi]["y"]
                 for j, qaid in enumerate(sw_queue[gi]):
-                    qx = QUEUE_HEAD_X - j * QUEUE_SPACING
+                    ad = agent_data.get(qaid, {})
+                    qx = ad.get("queue_visual_x", QUEUE_HEAD_X - j * QUEUE_SPACING)
                     trajectory_data.append((current_time, qaid, qx, gate_y, gi, "queue"))
 
         # ── 통계 & 프레임 ──
@@ -824,12 +895,13 @@ def run_simulation():
                 tl = ad.get("is_tagless", False)
                 frame_data.append((a.position[0], a.position[1], s, tl))
 
-            # 소프트웨어 큐 에이전트 (수학적 대기 위치)
+            # 소프트웨어 큐 에이전트 (시각화 위치 = visual_x, ease 적용)
             for gi in range(N_GATES):
                 gate_y = gates[gi]["y"]
                 for j, qaid in enumerate(sw_queue[gi]):
-                    qx = QUEUE_HEAD_X - j * QUEUE_SPACING
-                    tl = agent_data.get(qaid, {}).get("is_tagless", False)
+                    ad = agent_data.get(qaid, {})
+                    qx = ad.get("queue_visual_x", QUEUE_HEAD_X - j * QUEUE_SPACING)
+                    tl = ad.get("is_tagless", False)
                     frame_data.append((qx, gate_y, "queue", tl))
                 # 서비스 중 에이전트 (게이트 head에 표시)
                 if gate_service[gi] is not None and "agent_id" in gate_service[gi]:

@@ -696,12 +696,22 @@ def run_simulation():
 
         for gi in range(N_GATES):
             d = GATE_DIRECTIONS[gi]
-            # head에 가까운 순으로 정렬
             gate_candidates[gi].sort(reverse=(d == 'out'))
+            absorbed_this_step = 0
             for px_c, aid in gate_candidates[gi]:
-                # 시간 제한: 게이트당 0.7초에 1명만 흡수 (자연스러운 줄 형성)
-                if len(sw_queue[gi]) > 0 and current_time - last_queue_entry_time[gi] < QUEUE_ENTRY_MIN_GAP:
-                    break
+                # tail 안쪽(게이트 쪽) 여부 판단
+                tail = queue_tail_snap[gi]
+                if d == 'out':
+                    past_tail = px_c > tail + 0.5  # tail보다 0.5m 이상 게이트 쪽
+                else:
+                    past_tail = px_c < tail - 0.5
+                # 시간 제한: tail 근처면 0.7초 간격 / tail 안쪽이면 즉시 (단, 스텝당 1명)
+                if past_tail:
+                    if absorbed_this_step >= 1:
+                        continue  # 스텝당 1명만 (폭발 방지)
+                else:
+                    if len(sw_queue[gi]) > 0 and current_time - last_queue_entry_time[gi] < QUEUE_ENTRY_MIN_GAP:
+                        break
                 ad = agent_data[aid]
                 ad["queued"] = True
                 ad["queue_enter_time"] = current_time
@@ -718,6 +728,7 @@ def run_simulation():
                 ad["queue_shift_start"] = current_time
                 sim.mark_agent_for_removal(aid)
                 last_queue_entry_time[gi] = current_time
+                absorbed_this_step += 1
 
         # ── 소프트웨어 큐 서비스 처리 ──
         for gi in range(N_GATES):
@@ -810,43 +821,87 @@ def run_simulation():
                     if not ad:
                         continue
                     q_pos_idx = sw_queue[gi].index(qaid)
-                    qx = qh + sign * q_pos_idx * QUEUE_SPACING
+                    # 내 현재 큐 위치 (x좌표)
+                    my_qx = qh + sign * q_pos_idx * QUEUE_SPACING
                     gate_y = gates[gi]["y"]
+
+                    # 인접 게이트 중 새 큐 tail이 나보다 게이트에 가까운지 확인
                     new_gate = choose_gate_lrp(
-                        rng, (qx, gate_y), ad["original_speed"],
+                        rng, (my_qx, gate_y), ad["original_speed"],
                         ad["temperament"], gates, gate_queue_snap, stage="2nd",
                         allowed_gates=allowed)
-                    if (new_gate != gi and
-                            abs(new_gate - gi) <= 1 and
-                            new_gate in allowed and
-                            gate_queue_snap[new_gate] < gate_queue_snap[gi] - QUEUE_RESELECT_MIN_DIFF):
-                        sw_queue[gi].remove(qaid)
-                        sw_queue[new_gate].append(qaid)
-                        ad["gate_idx"] = new_gate
-                        stats["reroute_count"] += 1
-                        # 떠나는 게이트의 잔류 인원 시프트
-                        for _j, _qaid in enumerate(sw_queue[gi]):
-                            _qad = agent_data.get(_qaid)
-                            if _qad is None:
-                                continue
-                            _new_target = qh + sign * _j * QUEUE_SPACING
-                            if abs(_new_target - _qad.get("queue_target_x", _new_target)) > 1e-6:
-                                _qad["queue_shift_from"] = _qad.get("queue_visual_x", _new_target)
-                                _qad["queue_target_x"] = _new_target
-                                _qad["queue_shift_start"] = current_time
-                        # 옮긴 본인: 새 게이트의 마지막 슬롯으로 ease 시작
-                        _new_dir = GATE_DIRECTIONS[new_gate]
-                        _new_qh = QH_OUT if _new_dir == 'out' else QH_IN
-                        _new_sign = -1 if _new_dir == 'out' else +1
-                        _new_slot = len(sw_queue[new_gate]) - 1
-                        _new_target = _new_qh + _new_sign * _new_slot * QUEUE_SPACING
-                        ad["queue_shift_from"] = ad.get("queue_visual_x", _new_target)
-                        ad["queue_target_x"] = _new_target
-                        ad["queue_shift_start"] = current_time
-                        # 스냅샷 업데이트
-                        gate_queue_snap[gi] -= 1
-                        gate_queue_snap[new_gate] += 1
-                        moved = True
+
+                    if new_gate == gi or abs(new_gate - gi) > 1 or new_gate not in allowed:
+                        continue
+
+                    # 새 게이트 tail 위치
+                    _nd = GATE_DIRECTIONS[new_gate]
+                    _nqh = QH_OUT if _nd == 'out' else QH_IN
+                    _nsign = -1 if _nd == 'out' else +1
+                    _n_tail_x = _nqh + _nsign * gate_queue_snap[new_gate] * QUEUE_SPACING
+
+                    # 핵심 조건: 새 tail이 나보다 게이트에 가까운가?
+                    # out: tail_x > my_qx (x가 클수록 게이트 가까움)
+                    # in:  tail_x < my_qx (x가 작을수록 게이트 가까움)
+                    if d == 'out':
+                        better = _n_tail_x > my_qx + 0.3  # 최소 0.3m는 앞서야
+                    else:
+                        better = _n_tail_x < my_qx - 0.3
+
+                    if not better:
+                        continue
+
+                    # ── jockeying 실행: 큐에서 빠져나와 자유보행으로 재투입 ──
+                    sw_queue[gi].remove(qaid)
+                    ad["gate_idx"] = new_gate
+                    ad["queued"] = False  # 자유보행 상태로 전환
+                    stats["reroute_count"] += 1
+
+                    # JuPedSim에 자유보행 에이전트로 재투입
+                    # 현재 큐 위치에서 spawn → 새 게이트의 동적 wp로 이동
+                    _spawn_x = ad.get("queue_visual_x", my_qx)
+                    _spawn_y = gate_y
+                    _new_depth = min(gate_queue_snap[new_gate], MAX_QUEUE_DEPTH_WP)
+                    try:
+                        new_aid = sim.add_agent(
+                            jps.CollisionFreeSpeedModelV2AgentParameters(
+                                journey_id=journey_grid[new_gate][_new_depth],
+                                stage_id=approach_wp_grid[new_gate][_new_depth],
+                                position=(_spawn_x, _spawn_y),
+                                time_gap=CFSM_TIME_GAP,
+                                desired_speed=ad["original_speed"],
+                                radius=CFSM_RADIUS,
+                                strength_neighbor_repulsion=8.0,
+                                range_neighbor_repulsion=0.1,
+                                strength_geometry_repulsion=5.0,
+                                range_geometry_repulsion=0.02,
+                            ))
+                        # 기존 데이터 연결 (새 ID)
+                        agent_data[new_aid] = ad
+                        ad["target_depth"] = _new_depth
+                    except Exception:
+                        # 재투입 실패 시 원래 큐로 복귀
+                        sw_queue[gi].insert(q_pos_idx, qaid)
+                        ad["gate_idx"] = gi
+                        ad["queued"] = True
+                        stats["reroute_count"] -= 1
+                        continue
+
+                    # 떠나는 게이트의 잔류 인원 시프트
+                    for _j, _qaid in enumerate(sw_queue[gi]):
+                        _qad = agent_data.get(_qaid)
+                        if _qad is None:
+                            continue
+                        _new_target = qh + sign * _j * QUEUE_SPACING
+                        if abs(_new_target - _qad.get("queue_target_x", _new_target)) > 1e-6:
+                            _qad["queue_shift_from"] = _qad.get("queue_visual_x", _new_target)
+                            _qad["queue_target_x"] = _new_target
+                            _qad["queue_shift_start"] = current_time
+
+                    # 스냅샷 업데이트
+                    gate_queue_snap[gi] -= 1
+                    # 새 큐에는 아직 안 들어감 (자유보행 → tail 도달 후 정상 흡수)
+                    moved = True
 
         # ── 게이트 점유 상태 (재선택용) ──
         gate_occupied = [gate_service[gi] is not None for gi in range(N_GATES)]

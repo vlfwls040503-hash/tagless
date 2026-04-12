@@ -27,7 +27,7 @@ from seongsu_west import (
     GATE_X, GATE_LENGTH, GATE_PASSAGE_WIDTH, GATE_HOUSING_WIDTH,
     BARRIER_Y_BOTTOM, BARRIER_Y_TOP,
     CONCOURSE_LENGTH, CONCOURSE_WIDTH, NOTCH_X, NOTCH_Y,
-    STAIRS, EXITS, STRUCTURES, N_GATES,
+    STAIRS, EXITS, STRUCTURES, N_GATES, EXIT_STAIR_WIDTH,
 )
 
 plt.rcParams['font.family'] = 'Malgun Gothic'
@@ -371,18 +371,20 @@ def create_simulation():
             wp_id = sim.add_waypoint_stage((GATE_X - 0.5, g["y"]), 0.5)
         post_gate_wp_ids.append(wp_id)
 
-    # 출구 (하차류 도착지)
+    # 출구 (하차류 도착지) — 통로 폭에 맞춰서 exit stage 설정
+    _ecx = (EXITS[0]["x_start"] + EXITS[0]["x_end"]) / 2  # 27.5
+    _euw = EXIT_STAIR_WIDTH / 2                             # 1.25
     exit_upper = sim.add_exit_stage(Polygon([
-        (EXITS[0]["x_start"], EXITS[0]["y"] - 0.5),
-        (EXITS[0]["x_end"],   EXITS[0]["y"] - 0.5),
-        (EXITS[0]["x_end"],   EXITS[0]["y"] + 0.5),
-        (EXITS[0]["x_start"], EXITS[0]["y"] + 0.5),
+        (_ecx - _euw, EXITS[0]["y"] - 0.5),
+        (_ecx + _euw, EXITS[0]["y"] - 0.5),
+        (_ecx + _euw, EXITS[0]["y"] + 0.5),
+        (_ecx - _euw, EXITS[0]["y"] + 0.5),
     ]))
     exit_lower = sim.add_exit_stage(Polygon([
-        (EXITS[1]["x_start"], EXITS[1]["y"] - 0.5),
-        (EXITS[1]["x_end"],   EXITS[1]["y"] - 0.5),
-        (EXITS[1]["x_end"],   EXITS[1]["y"] + 0.5),
-        (EXITS[1]["x_start"], EXITS[1]["y"] + 0.5),
+        (_ecx - _euw, EXITS[1]["y"] - 0.5),
+        (_ecx + _euw, EXITS[1]["y"] - 0.5),
+        (_ecx + _euw, EXITS[1]["y"] + 0.5),
+        (_ecx - _euw, EXITS[1]["y"] + 0.5),
     ]))
 
     # 계단 (승차류 도착지) — 작은 polygon으로 exit stage 등록
@@ -396,26 +398,50 @@ def create_simulation():
         ]))
         stair_exits.append(eid)
 
-    # 접근 Journey: 큐 깊이별 동적 waypoint → post_gate → 도착지
+    # 출구 통로 입구 Waypoint: 에이전트를 벽 모서리가 아닌 통로 중앙으로 유도
+    # upper 통로 입구: (27.5, 22.5)  — 통로 y하단 근처
+    # lower 통로 입구: (27.5, 4.5)   — 통로 y상단 근처
+    exit_guide_upper = sim.add_waypoint_stage((_ecx, EXITS[0]["y"] - 1.5), 1.0)
+    exit_guide_lower = sim.add_waypoint_stage((_ecx, EXITS[1]["y"] + 1.5), 1.0)
+
+    # 접근 Journey: 큐 깊이별 동적 waypoint → post_gate → (출구 가이드) → 도착지
     journey_grid = []  # [gate][depth] -> journey_id
     for i, g in enumerate(gates):
         d = GATE_DIRECTIONS[i]
         if d == 'out':
             target = exit_upper if g["y"] > CONCOURSE_WIDTH / 2 else exit_lower
+            guide = exit_guide_upper if g["y"] > CONCOURSE_WIDTH / 2 else exit_guide_lower
         else:
             target = stair_exits[0] if g["y"] > CONCOURSE_WIDTH / 2 else stair_exits[1]
+            guide = None
         gate_jids = []
         for depth in range(MAX_QUEUE_DEPTH_WP + 1):
             wp_id = approach_wp_grid[i][depth]
-            journey = jps.JourneyDescription([
-                wp_id, post_gate_wp_ids[i], target
-            ])
-            journey.set_transition_for_stage(
-                wp_id,
-                jps.Transition.create_fixed_transition(post_gate_wp_ids[i]))
-            journey.set_transition_for_stage(
-                post_gate_wp_ids[i],
-                jps.Transition.create_fixed_transition(target))
+            if guide:
+                # 하차: approach → post_gate → 출구 가이드 → exit
+                journey = jps.JourneyDescription([
+                    wp_id, post_gate_wp_ids[i], guide, target
+                ])
+                journey.set_transition_for_stage(
+                    wp_id,
+                    jps.Transition.create_fixed_transition(post_gate_wp_ids[i]))
+                journey.set_transition_for_stage(
+                    post_gate_wp_ids[i],
+                    jps.Transition.create_fixed_transition(guide))
+                journey.set_transition_for_stage(
+                    guide,
+                    jps.Transition.create_fixed_transition(target))
+            else:
+                # 승차: approach → post_gate → 계단
+                journey = jps.JourneyDescription([
+                    wp_id, post_gate_wp_ids[i], target
+                ])
+                journey.set_transition_for_stage(
+                    wp_id,
+                    jps.Transition.create_fixed_transition(post_gate_wp_ids[i]))
+                journey.set_transition_for_stage(
+                    post_gate_wp_ids[i],
+                    jps.Transition.create_fixed_transition(target))
             jid = sim.add_journey(journey)
             gate_jids.append(jid)
         journey_grid.append(gate_jids)
@@ -427,12 +453,20 @@ def create_simulation():
         d = GATE_DIRECTIONS[i]
         if d == 'out':
             target = exit_upper if g["y"] > CONCOURSE_WIDTH / 2 else exit_lower
+            guide = exit_guide_upper if g["y"] > CONCOURSE_WIDTH / 2 else exit_guide_lower
+            journey = jps.JourneyDescription([post_gate_wp_ids[i], guide, target])
+            journey.set_transition_for_stage(
+                post_gate_wp_ids[i],
+                jps.Transition.create_fixed_transition(guide))
+            journey.set_transition_for_stage(
+                guide,
+                jps.Transition.create_fixed_transition(target))
         else:
             target = stair_exits[0] if g["y"] > CONCOURSE_WIDTH / 2 else stair_exits[1]
-        journey = jps.JourneyDescription([post_gate_wp_ids[i], target])
-        journey.set_transition_for_stage(
-            post_gate_wp_ids[i],
-            jps.Transition.create_fixed_transition(target))
+            journey = jps.JourneyDescription([post_gate_wp_ids[i], target])
+            journey.set_transition_for_stage(
+                post_gate_wp_ids[i],
+                jps.Transition.create_fixed_transition(target))
         jid = sim.add_journey(journey)
         post_journey_ids.append(jid)
 
@@ -547,20 +581,23 @@ def run_simulation():
                         spawn_y += rng.uniform(-1.0, 1.0)
                         spawn_y = np.clip(spawn_y, 2.0, NOTCH_Y - 2.0)
                     dist_to_gate = GATE_X - spawn_x   # 양수: 게이트 왼쪽
-                else:  # 'in' 승차류 — 두 출구 중 하나에서 spawn
+                else:  # 'in' 승차류 — 출구 통로 안에서 spawn
                     exit_idx = info  # 0=upper(y=24), 1=lower(y=3)
                     ex = EXITS[exit_idx]
-                    # 출구 폴리곤 안쪽에서 spawn (x: x_start~x_end, y: 출구 y에서 1m 안쪽)
-                    spawn_x = rng.uniform(ex['x_start'] + 0.3, ex['x_end'] - 0.3)
-                    # upper(y=24)면 y - 1, lower(y=3)면 y + 1 (대합실 안쪽)
+                    # 통로 중심/폭
+                    ecx = (ex['x_start'] + ex['x_end']) / 2  # 27.5
+                    euw = EXIT_STAIR_WIDTH / 2                 # 1.25
+                    # 통로 x범위 안에서 spawn
+                    spawn_x = rng.uniform(ecx - euw + 0.3, ecx + euw - 0.3)
+                    # upper: y=[23.5, 24.5], lower: y=[2.5, 3.5]
                     if exit_idx == 0:
-                        spawn_y = ex['y'] - 1.0 - rng.uniform(0, 0.5)
+                        spawn_y = ex['y'] - rng.uniform(0, 0.5)
                     else:
-                        spawn_y = ex['y'] + 1.0 + rng.uniform(0, 0.5)
+                        spawn_y = ex['y'] + rng.uniform(0, 0.5)
                     if retry > 0:
-                        spawn_x += rng.uniform(-0.5, 0.5)
-                        spawn_y += rng.uniform(-0.3, 0.3)
-                    dist_to_gate = spawn_x - (GATE_X + GATE_LENGTH)  # 양수: 게이트 오른쪽
+                        spawn_x += rng.uniform(-0.2, 0.2)
+                        spawn_x = np.clip(spawn_x, ecx - euw + 0.2, ecx + euw - 0.2)
+                    dist_to_gate = spawn_x - (GATE_X + GATE_LENGTH)
 
                 if dist_to_gate <= CHOICE_DIST_1ST:
                     gate_idx = choose_gate_lrp(

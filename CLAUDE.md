@@ -148,8 +148,10 @@ fzj/seyfried2005_single_file.txt   <- FZJ 기본다이어그램 실측
 
 ## 절대 되돌리면 안 되는 수정 (DO NOT REVERT)
 
-> 과거 이미 검증된 수정 사항. 리팩토링이나 기능 추가 시에도 반드시 유지할 것.
-> 유실 시 **보행 행태가 비현실적**으로 됨 (큐 이동 혼란, 횡단 가로지름 등)
+> 최종 안정 버전 — **2026-04-13**
+> 스냅샷: `simulation/run_west_simulation_cfsm_20260413.py` / `simulation/seongsu_west_20260413.py`
+> 이 수정 사항은 **절대 변경/제거 금지**. 리팩토링이나 기능 추가 시에도 반드시 유지할 것.
+> 유실 시 **보행 행태가 비현실적**으로 됨 (큐 이동 혼란, 횡단 가로지름, 게이트 쏠림 등)
 
 ### 1. QUEUE_RESELECT_ENABLED = False (0040b53, 2026-04-03)
 **위치**: `simulation/run_west_simulation_cfsm.py` 큐 파라미터

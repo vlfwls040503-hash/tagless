@@ -57,99 +57,13 @@ EXITS = [
     {"id": "lower", "x_start": 26.0, "x_end": 29.0, "y": 3.0},
 ]
 
-# 출구 계단 병목 파라미터 (Weidmann 1993: 상행 1.07 ped/s/m)
-EXIT_STAIR_WIDTH = 2.5           # 출구 계단 유효 폭 (m) — 가정
-EXIT_STAIR_LENGTH = 3.0          # 출구 계단 진입 통로 길이 (m)
-EXIT_STAIR_DISCHARGE = 1.07      # Weidmann 상행 방출율 (ped/s/m)
-
-# 출구 계단 통로 좌표 (좁은 통로 = 병목)
-# upper: y_center=24 → 통로 y 범위 [24 - w/2, 24 + w/2] (벽 바깥은 구조물)
-# lower: y_center=3  → 통로 y 범위 [3 - w/2, 3 + w/2]
-EXIT_CORRIDORS = [
-    {
-        "id": "upper",
-        "x_start": 26.0,
-        "x_end": 26.0 + EXIT_STAIR_LENGTH,
-        "y_center": EXITS[0]["y"],
-        "width": EXIT_STAIR_WIDTH,
-    },
-    {
-        "id": "lower",
-        "x_start": 26.0,
-        "x_end": 26.0 + EXIT_STAIR_LENGTH,
-        "y_center": EXITS[1]["y"],
-        "width": EXIT_STAIR_WIDTH,
-    },
-]
-
 # =============================================================================
 # 5. 비통행 구조물 (빗금 영역)
 # =============================================================================
-# 출구 계단 병목: 출구가 y방향(세로)으로 빠짐 (성수역 안내도 확인)
-# 출구 선(x=26~29) 중 EXIT_STAIR_WIDTH(2.5m)만 열리고 양쪽은 구조물로 막음
-# 에이전트가 x방향으로 걸어와서 y방향으로 빠지는 출구에 2.5m 폭 병목 형성
-_uw = EXIT_STAIR_WIDTH / 2
-_exit_cx = (EXITS[0]["x_start"] + EXITS[0]["x_end"]) / 2  # 27.5
-
-# 출구 병목: 가로벽(x방향)으로 출구 폭 제한
-# 출구 선(y=24, y=3)까지 넓은 대합실 → 가로벽으로 2.5m만 남김
-# 에이전트가 가로벽에 유도돼서 통로로 몰림
-#
-# upper 출구 (y=24):
-#   가로벽 y=23에서 x방향으로 = 통로(x=26.25~28.75) 빼고 막음
-#   왼쪽 가로벽: x=[14, 26.25], y=[23, 23.3]  (출구까지 열린 공간의 좌측 차단)
-#   오른쪽 가로벽: x=[28.75, 48], y=[23, 23.3]
-#
-# lower 출구 (y=3):
-#   가로벽 y=4에서 x방향
-#   왼쪽 가로벽: x=[14, 26.25], y=[3.7, 4]
-#   오른쪽 가로벽: x=[28.75, 48], y=[3.7, 4]
-
-_wall_thick = 0.3  # 가로벽 두께
-
 STRUCTURES = [
-    # ── 상단 출구 가로벽 (y=23, x=26~48 에만 — 대합실 내부는 열림) ──
-    # 좌측: x=[26, 통로 좌측(26.25)]
-    {"id": "upper_hwall_left", "coords": [
-        (EXITS[0]["x_start"], EXITS[0]["y"] - 1.0),
-        (_exit_cx - _uw,       EXITS[0]["y"] - 1.0),
-        (_exit_cx - _uw,       EXITS[0]["y"] - 1.0 + _wall_thick),
-        (EXITS[0]["x_start"], EXITS[0]["y"] - 1.0 + _wall_thick),
-    ]},
-    # 우측: x=[통로 우측(28.75), 48]
-    {"id": "upper_hwall_right", "coords": [
-        (_exit_cx + _uw, EXITS[0]["y"] - 1.0),
-        (48,             EXITS[0]["y"] - 1.0),
-        (48,             EXITS[0]["y"] - 1.0 + _wall_thick),
-        (_exit_cx + _uw, EXITS[0]["y"] - 1.0 + _wall_thick),
-    ]},
-
-    # ── 하단 출구 가로벽 (y=4, x=26~48 에만) ──
-    # 좌측: x=[26, 통로 좌측(26.25)]
-    {"id": "lower_hwall_left", "coords": [
-        (EXITS[1]["x_start"], EXITS[1]["y"] + 1.0 - _wall_thick),
-        (_exit_cx - _uw,       EXITS[1]["y"] + 1.0 - _wall_thick),
-        (_exit_cx - _uw,       EXITS[1]["y"] + 1.0),
-        (EXITS[1]["x_start"], EXITS[1]["y"] + 1.0),
-    ]},
-    # 우측: x=[통로 우측(28.75), 48]
-    {"id": "lower_hwall_right", "coords": [
-        (_exit_cx + _uw, EXITS[1]["y"] + 1.0 - _wall_thick),
-        (48,             EXITS[1]["y"] + 1.0 - _wall_thick),
-        (48,             EXITS[1]["y"] + 1.0),
-        (_exit_cx + _uw, EXITS[1]["y"] + 1.0),
-    ]},
-
-    # ── 기존 뒤쪽 구역 (출구 뒤 비통행 구역) ──
-    {"id": "upper_right", "coords": [
-        (30, 16), (48, 16), (48, 24), (30, 24),
-    ]},
-    {"id": "lower_right", "coords": [
-        (30, 3), (48, 3), (48, 11), (30, 11),
-    ]},
+    {"id": "upper_right", "coords": [(30, 16), (48, 16), (48, 24), (30, 24)]},
+    {"id": "lower_right", "coords": [(30, 3),  (48, 3),  (48, 11), (30, 11)]},
 ]
-# upper 통로: 가로벽(y=23~23.3)에 2.5m 개구부 → 그 위(y=23~25)는 출구 영역
-# lower 통로: 가로벽(y=3.7~4)에 2.5m 개구부 → 그 아래(y=0~3.7)는 출구 영역
 
 
 # =============================================================================

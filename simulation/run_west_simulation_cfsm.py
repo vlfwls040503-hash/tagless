@@ -1,14 +1,25 @@
 """
-성수역 서쪽 대합실 양방향 시뮬레이션 (하차 + 승차)
+성수역 서쪽 대합실 보행자 시뮬레이션 — CFSM V2 (소프트웨어 큐 기반)
 
-run_demo.py 를 양방향으로 확장한 버전:
-- 게이트별 방향 속성 (in/out): 단방향 분리 운영
-- 하차류: 계단 → 게이트(out) → 출구
-- 승차류: 출구 → 게이트(in) → 계단
-- 모든 큐 로직(꼬리 흡수, 동적 wp, 시프트, jockeying, 동적 time_gap) 그대로
-- 큐 head 위치만 방향별로 분리:
-    out: HEAD = GATE_X - 0.3 (좌측)
-    in : HEAD = GATE_X + GATE_LENGTH + 0.3 (우측)
+v8 (GCFM) -> CFSM -> software queue 재구현:
+  물리 엔진: CollisionFreeSpeedModelV2 (Tordeux et al., 2016)
+  - 속도 기반 모델 (힘 기반이 아님) -> 계산 효율 UP
+  - 충돌 없는 경로 예측 -> 좁은 통로 자연 통과
+
+  게이트 통과 메커니즘 (소프트웨어 큐):
+  - CFSM은 자유보행만 처리 (계단 → 게이트 접근 구역)
+  - 에이전트가 게이트 접근 구역(x > 10.5) 도달 → 시뮬레이션에서 제거
+  - 순수 Python FIFO 큐로 대기열 관리 (게이트별 list)
+  - 서비스 완료 시 게이트 출구에 에이전트 재투입 → post_gate journey로 퇴장
+
+  기존 유지:
+  - 게이트 선택: Gao et al. (2019) LRP 모델 (3단계 재선택)
+  - 서비스 시간: Gao (2019) 실측 기반 lognormal
+
+논문 프레이밍:
+  - 전략(의사결정): Gao et al. (2019) LRP 모델
+  - 전술(물리적 보행): CFSM V2 (Tordeux et al., 2016)
+  - 게이트 통과: 소프트웨어 큐 + 서비스 시간 모델
 """
 
 import jupedsim as jps
@@ -27,7 +38,7 @@ from seongsu_west import (
     GATE_X, GATE_LENGTH, GATE_PASSAGE_WIDTH, GATE_HOUSING_WIDTH,
     BARRIER_Y_BOTTOM, BARRIER_Y_TOP,
     CONCOURSE_LENGTH, CONCOURSE_WIDTH, NOTCH_X, NOTCH_Y,
-    STAIRS, EXITS, STRUCTURES, N_GATES, EXIT_STAIR_WIDTH,
+    STAIRS, EXITS, STRUCTURES, N_GATES,
 )
 
 plt.rcParams['font.family'] = 'Malgun Gothic'
@@ -36,27 +47,14 @@ plt.rcParams['axes.unicode_minus'] = False
 # =============================================================================
 # 시뮬레이션 파라미터
 # =============================================================================
-SIM_TIME = 360.0  # 데모: 열차 2편
+SIM_TIME = 120.0  # 열차 1편 + 큐 처리 여유 (영상과 동일)
 DT = 0.05
-
-# =============================================================================
-# 양방향 운영 파라미터
-# =============================================================================
-# 게이트 방향 분배 (단방향 분리 운영)
-# 'out': 하차 전용, 'in': 승차 전용
-# 성수역 첨두 기준 — 하차가 압도적이므로 out 비율 ↑
-GATE_DIRECTIONS = ['in', 'in', 'out', 'out', 'out', 'out', 'out']
-INBOUND_GATES  = [i for i, d in enumerate(GATE_DIRECTIONS) if d == 'in']
-OUTBOUND_GATES = [i for i, d in enumerate(GATE_DIRECTIONS) if d == 'out']
-
-# 승차 도착률 (성수역 08-09시 970명/h ÷ 60 = 16.2명/min ÷ 60 = 0.27 ped/s)
-INBOUND_RATE = 16.2 / 60.0   # ped/s, 균일 NHPP
 
 # =============================================================================
 # 도착 모델
 # =============================================================================
 TRAIN_INTERVAL = 180.0
-TRAIN_ALIGHTING = 150  # 데모: 축소
+TRAIN_ALIGHTING = 234  # 08-09시 평일 평균 (11,214명/h ÷ 24편 × 서쪽50%)
 PLATOON_SPREAD = 50.0  # (미사용, 물리 기반으로 대체)
 
 # 성수역 물리 기반 도착 모델 파라미터
@@ -105,7 +103,7 @@ GATE_PASS_SPEED = 0.65
 GATE_PHYS_LENGTH = 1.4
 
 TAGLESS_SERVICE_TIME = 1.2    # 게이트 물리 통과 시간 (1.5m / 1.3m/s)
-TAGLESS_RATIO = 0.0           # 데모: 태그 전용 (baseline)
+TAGLESS_RATIO = 1.0           # 시나리오: 태그리스 100%
 
 # =============================================================================
 # 게이트 선택 모델: Gao (2019) LRP
@@ -156,39 +154,47 @@ OUTPUT_DIR.mkdir(exist_ok=True)
 # 유틸 함수
 # =============================================================================
 def generate_arrival_schedule(rng, sim_time):
-    """양방향 도착 스케줄 (하차 + 승차).
+    """물리 기반 도착 스케줄 (성수역 구조 반영).
 
-    하차류: 열차 도착 펄스 (run_demo.py 와 동일)
-    승차류: 균일 NHPP (분당 16명, 출구에서 spawn)
-
-    Returns: list of (time, kind, info) tuples
-        kind='out': info=stair_idx
-        kind='in':  info=spawn_y (출구 부근 y좌표)
+    도착시간 = 열차도착 + 하차지연 + 승강장보행 + 계단하행 + 계단→게이트 보행
+    - 계단이 승강장 양 끝에 위치 → 가까운 쪽 계단으로 이동
+    - 승객 위치: 열차 전체에 균등 분포
+    - 열차가 교대로 도착하므로 계단도 교대.
     """
     min_gap = 1.0 / STAIR_CAPACITY
 
     arrivals = []
-
-    # ── 하차류 (열차별 펄스) ──
     train_time = FIRST_TRAIN_TIME
     train_count = 0
     while train_time < sim_time:
         n_passengers = rng.poisson(TRAIN_ALIGHTING)
+        # 열차별 계단 1개: 짝수번째=upper(0), 홀수번째=lower(1)
         stair_idx = train_count % 2
 
         times = []
         for _ in range(n_passengers):
+            # 1. 열차 내 위치 (균등분포, 0 = 계단 쪽 끝)
             pos_on_platform = rng.uniform(0, PLATFORM_LENGTH)
+
+            # 2. 가까운 쪽 계단까지 거리 (양 끝에 계단)
             dist_to_stair = min(pos_on_platform, PLATFORM_LENGTH - pos_on_platform)
+
+            # 3. 개인별 보행속도
             walk_speed = max(0.8, rng.normal(WALK_SPEED_MEAN, WALK_SPEED_STD))
+
+            # 4. 하차 지연 (문 앞=0, 안쪽=최대 10초)
             alighting_delay = rng.uniform(0, ALIGHTING_DELAY_MAX)
+
+            # 5. 총 도착시간
             t_platform_walk = dist_to_stair / walk_speed
             t_stair_descent = STAIR_DESCENT_TIME
             t_stair_to_gate = STAIR_TO_GATE_DIST / walk_speed
             raw_t = train_time + alighting_delay + t_platform_walk + t_stair_descent + t_stair_to_gate
+
             times.append(raw_t)
         times.sort()
 
+        # 방출율 제약 (계단 용량)
         for j in range(1, len(times)):
             earliest = times[j - 1] + min_gap
             if times[j] < earliest:
@@ -196,19 +202,10 @@ def generate_arrival_schedule(rng, sim_time):
 
         for t in times:
             if t < sim_time:
-                arrivals.append((t, 'out', stair_idx))
+                arrivals.append((t, stair_idx))
 
         train_time += TRAIN_INTERVAL
         train_count += 1
-
-    # ── 승차류 (균일 NHPP, 출구에서 spawn) ──
-    t = 0.0
-    while t < sim_time:
-        t += rng.exponential(1.0 / INBOUND_RATE)
-        if t < sim_time:
-            # 두 출구 중 무작위 (upper=0, lower=1)
-            exit_idx = int(rng.choice([0, 1]))
-            arrivals.append((t, 'in', exit_idx))
 
     arrivals.sort(key=lambda x: x[0])
     return arrivals
@@ -268,15 +265,11 @@ def get_exit_position(gate):
 
 def choose_gate_lrp(rng, agent_pos, agent_speed, temperament, gates,
                     gate_queue, stage="1st", gate_occupied=None,
-                    current_gate_idx=None, allowed_gates=None):
-    """LRP 게이트 선택. allowed_gates 가 주어지면 그 안에서만 선택 (방향 분리)."""
+                    current_gate_idx=None):
     omega = TEMPERAMENTS[temperament]
     omega_wait = omega["omega_wait"]
     omega_walk = omega["omega_walk"]
     n_gates = len(gates)
-
-    if allowed_gates is None:
-        allowed_gates = list(range(n_gates))
 
     if stage == "3rd":
         if (current_gate_idx is not None and gate_occupied is not None
@@ -284,13 +277,13 @@ def choose_gate_lrp(rng, agent_pos, agent_speed, temperament, gates,
             candidates = []
             for delta in [-1, 1]:
                 adj = current_gate_idx + delta
-                if adj in allowed_gates and not gate_occupied[adj]:
+                if 0 <= adj < n_gates and not gate_occupied[adj]:
                     d = abs(agent_pos[1] - gates[adj]["y"])
                     candidates.append((d, adj))
             if candidates:
                 candidates.sort()
                 return candidates[0][1]
-        return current_gate_idx if current_gate_idx is not None else allowed_gates[0]
+        return current_gate_idx if current_gate_idx is not None else 0
 
     l1_actual = np.array([
         np.hypot(agent_pos[0] - g["x"], agent_pos[1] - g["y"])
@@ -299,8 +292,7 @@ def choose_gate_lrp(rng, agent_pos, agent_speed, temperament, gates,
     l1_est = estimate_distances_with_order_preservation(rng, l1_actual)
 
     costs = np.full(n_gates, np.inf)
-    for j in allowed_gates:
-        gate = gates[j]
+    for j, gate in enumerate(gates):
         if stage == "1st":
             exit_x, exit_y = get_exit_position(gate)
             gate_exit_x = gate["x"] + GATE_LENGTH
@@ -313,172 +305,107 @@ def choose_gate_lrp(rng, agent_pos, agent_speed, temperament, gates,
         wait_time = n_est * SERVICE_TIME_MEAN
         costs[j] = omega_wait * wait_time + omega_walk * walk_time
 
-    # softmax over allowed
-    allowed_costs = costs[allowed_gates]
-    shifted = allowed_costs - np.min(allowed_costs)
+    shifted = costs - np.min(costs)
     exp_neg = np.exp(-shifted)
     probs = exp_neg / exp_neg.sum()
-    return int(allowed_gates[int(rng.choice(len(allowed_gates), p=probs))])
+    return int(rng.choice(n_gates, p=probs))
 
 
 # =============================================================================
 # 시뮬레이션 생성 (CFSM V2, 소프트웨어 큐 기반)
 # =============================================================================
 def create_simulation():
-    """양방향 시뮬레이션 생성.
-
-    게이트 방향(out/in)에 따라:
-    - out (하차): wp가 게이트 좌측 (x < GATE_X), 큐 head = GATE_X - 0.3
-    - in  (승차): wp가 게이트 우측 (x > GATE_X+LEN), 큐 head = GATE_X + LEN + 0.3
-    """
     gates = calculate_gate_positions()
 
+    # 기하구조: 배리어 없음 (소프트웨어 제어)
     walkable, _, _ = build_geometry(gates, include_barrier=False)
+    # 시각화용: 실제 규격 (1.5m 두께, 0.55m 통로)
     _, vis_obstacles, gate_openings = build_geometry(gates, include_barrier=True)
 
+    # CFSM V2
     model = jps.CollisionFreeSpeedModelV2()
     sim = jps.Simulation(model=model, geometry=walkable, dt=DT)
 
     gate_x_end = GATE_X + GATE_LENGTH
-    QH_OUT = GATE_X - 0.3
-    QH_IN  = gate_x_end + 0.3
 
-    # 1단계: 접근 Waypoint (방향에 따라 좌/우)
+    # 1단계: 접근 Waypoint (큐 깊이별 동적 위치)
     approach_wp_grid = []  # [gate][depth] -> wp_id
-    for i, g in enumerate(gates):
-        d = GATE_DIRECTIONS[i]
+    for g in gates:
         gate_wps = []
         for depth in range(MAX_QUEUE_DEPTH_WP + 1):
-            if d == 'out':
-                wp_x = (QH_OUT - 0.8) if depth == 0 else (QH_OUT - depth * QUEUE_SPACING - 0.8)
-                wp_x = max(wp_x, 2.0)
-            else:  # 'in'
-                wp_x = (QH_IN + 0.8) if depth == 0 else (QH_IN + depth * QUEUE_SPACING + 0.8)
-                wp_x = min(wp_x, CONCOURSE_LENGTH - 2.0)
+            if depth == 0:
+                wp_x = QUEUE_HEAD_X - 0.8  # 빈 큐: 큐 head 0.8m 뒤에서 감속
+            else:
+                wp_x = QUEUE_HEAD_X - depth * QUEUE_SPACING - 0.8
+            wp_x = max(wp_x, 2.0)
             wp_id = sim.add_waypoint_stage((wp_x, g["y"]), 0.5)
             gate_wps.append(wp_id)
         approach_wp_grid.append(gate_wps)
     approach_wp_ids = [approach_wp_grid[i][0] for i in range(N_GATES)]
 
-    # 2단계: 게이트 통과 후 Waypoint
-    # out: 우측 (출구 방향)  /  in: 좌측 (계단 방향)
+    # 2단계: 게이트 출구 Waypoint (서비스 완료 후 재투입 지점)
     post_gate_wp_ids = []
-    for i, g in enumerate(gates):
-        d = GATE_DIRECTIONS[i]
-        if d == 'out':
-            wp_id = sim.add_waypoint_stage((gate_x_end + 0.5, g["y"]), 0.5)
-        else:
-            wp_id = sim.add_waypoint_stage((GATE_X - 0.5, g["y"]), 0.5)
+    for g in gates:
+        wp_id = sim.add_waypoint_stage((gate_x_end + 0.5, g["y"]), 0.5)
         post_gate_wp_ids.append(wp_id)
 
-    # 출구 (하차류 도착지) — 통로 폭에 맞춰서 exit stage 설정
-    _ecx = (EXITS[0]["x_start"] + EXITS[0]["x_end"]) / 2  # 27.5
-    _euw = EXIT_STAIR_WIDTH / 2                             # 1.25
+    # 출구
     exit_upper = sim.add_exit_stage(Polygon([
-        (_ecx - _euw, EXITS[0]["y"] - 0.5),
-        (_ecx + _euw, EXITS[0]["y"] - 0.5),
-        (_ecx + _euw, EXITS[0]["y"] + 0.5),
-        (_ecx - _euw, EXITS[0]["y"] + 0.5),
+        (EXITS[0]["x_start"], EXITS[0]["y"] - 0.5),
+        (EXITS[0]["x_end"],   EXITS[0]["y"] - 0.5),
+        (EXITS[0]["x_end"],   EXITS[0]["y"] + 0.5),
+        (EXITS[0]["x_start"], EXITS[0]["y"] + 0.5),
     ]))
     exit_lower = sim.add_exit_stage(Polygon([
-        (_ecx - _euw, EXITS[1]["y"] - 0.5),
-        (_ecx + _euw, EXITS[1]["y"] - 0.5),
-        (_ecx + _euw, EXITS[1]["y"] + 0.5),
-        (_ecx - _euw, EXITS[1]["y"] + 0.5),
+        (EXITS[1]["x_start"], EXITS[1]["y"] - 0.5),
+        (EXITS[1]["x_end"],   EXITS[1]["y"] - 0.5),
+        (EXITS[1]["x_end"],   EXITS[1]["y"] + 0.5),
+        (EXITS[1]["x_start"], EXITS[1]["y"] + 0.5),
     ]))
 
-    # 계단 (승차류 도착지) — 작은 polygon으로 exit stage 등록
-    stair_exits = []
-    for stair in STAIRS:
-        eid = sim.add_exit_stage(Polygon([
-            (stair["x"] - 0.4, stair["y_start"]),
-            (stair["x"] + 0.4, stair["y_start"]),
-            (stair["x"] + 0.4, stair["y_end"]),
-            (stair["x"] - 0.4, stair["y_end"]),
-        ]))
-        stair_exits.append(eid)
-
-    # 출구 통로 입구 Waypoint: 에이전트를 벽 모서리가 아닌 통로 중앙으로 유도
-    # upper 통로 입구: (27.5, 22.5)  — 통로 y하단 근처
-    # lower 통로 입구: (27.5, 4.5)   — 통로 y상단 근처
-    exit_guide_upper = sim.add_waypoint_stage((_ecx, EXITS[0]["y"] - 1.5), 1.0)
-    exit_guide_lower = sim.add_waypoint_stage((_ecx, EXITS[1]["y"] + 1.5), 1.0)
-
-    # 접근 Journey: 큐 깊이별 동적 waypoint → post_gate → (출구 가이드) → 도착지
+    # 접근 Journey: 큐 깊이별 동적 waypoint → post_gate → exit
     journey_grid = []  # [gate][depth] -> journey_id
     for i, g in enumerate(gates):
-        d = GATE_DIRECTIONS[i]
-        if d == 'out':
-            target = exit_upper if g["y"] > CONCOURSE_WIDTH / 2 else exit_lower
-            guide = exit_guide_upper if g["y"] > CONCOURSE_WIDTH / 2 else exit_guide_lower
-        else:
-            target = stair_exits[0] if g["y"] > CONCOURSE_WIDTH / 2 else stair_exits[1]
-            guide = None
+        target_exit = exit_upper if g["y"] > CONCOURSE_WIDTH / 2 else exit_lower
         gate_jids = []
         for depth in range(MAX_QUEUE_DEPTH_WP + 1):
             wp_id = approach_wp_grid[i][depth]
-            if guide:
-                # 하차: approach → post_gate → 출구 가이드 → exit
-                journey = jps.JourneyDescription([
-                    wp_id, post_gate_wp_ids[i], guide, target
-                ])
-                journey.set_transition_for_stage(
-                    wp_id,
-                    jps.Transition.create_fixed_transition(post_gate_wp_ids[i]))
-                journey.set_transition_for_stage(
-                    post_gate_wp_ids[i],
-                    jps.Transition.create_fixed_transition(guide))
-                journey.set_transition_for_stage(
-                    guide,
-                    jps.Transition.create_fixed_transition(target))
-            else:
-                # 승차: approach → post_gate → 계단
-                journey = jps.JourneyDescription([
-                    wp_id, post_gate_wp_ids[i], target
-                ])
-                journey.set_transition_for_stage(
-                    wp_id,
-                    jps.Transition.create_fixed_transition(post_gate_wp_ids[i]))
-                journey.set_transition_for_stage(
-                    post_gate_wp_ids[i],
-                    jps.Transition.create_fixed_transition(target))
+            journey = jps.JourneyDescription([
+                wp_id, post_gate_wp_ids[i], exit_upper, exit_lower
+            ])
+            journey.set_transition_for_stage(
+                wp_id,
+                jps.Transition.create_fixed_transition(post_gate_wp_ids[i]))
+            journey.set_transition_for_stage(
+                post_gate_wp_ids[i],
+                jps.Transition.create_fixed_transition(target_exit))
             jid = sim.add_journey(journey)
             gate_jids.append(jid)
         journey_grid.append(gate_jids)
     journey_ids = [journey_grid[i][0] for i in range(N_GATES)]
 
-    # Post-gate only Journey: 서비스 완료 후 재투입용
+    # Post-gate only Journey: 재투입 에이전트용 (post_gate_wp -> exit)
     post_journey_ids = []
     for i, g in enumerate(gates):
-        d = GATE_DIRECTIONS[i]
-        if d == 'out':
-            target = exit_upper if g["y"] > CONCOURSE_WIDTH / 2 else exit_lower
-            guide = exit_guide_upper if g["y"] > CONCOURSE_WIDTH / 2 else exit_guide_lower
-            journey = jps.JourneyDescription([post_gate_wp_ids[i], guide, target])
-            journey.set_transition_for_stage(
-                post_gate_wp_ids[i],
-                jps.Transition.create_fixed_transition(guide))
-            journey.set_transition_for_stage(
-                guide,
-                jps.Transition.create_fixed_transition(target))
-        else:
-            target = stair_exits[0] if g["y"] > CONCOURSE_WIDTH / 2 else stair_exits[1]
-            journey = jps.JourneyDescription([post_gate_wp_ids[i], target])
-            journey.set_transition_for_stage(
-                post_gate_wp_ids[i],
-                jps.Transition.create_fixed_transition(target))
+        target_exit = exit_upper if g["y"] > CONCOURSE_WIDTH / 2 else exit_lower
+        journey = jps.JourneyDescription([
+            post_gate_wp_ids[i], exit_upper, exit_lower
+        ])
+        journey.set_transition_for_stage(
+            post_gate_wp_ids[i],
+            jps.Transition.create_fixed_transition(target_exit))
         jid = sim.add_journey(journey)
         post_journey_ids.append(jid)
 
-    # 기본 journey: 하차류는 OUTBOUND 중간, 승차류는 INBOUND 중간
-    default_out_gate = OUTBOUND_GATES[len(OUTBOUND_GATES) // 2]
-    default_in_gate  = INBOUND_GATES[len(INBOUND_GATES) // 2]
+    mid_gate = N_GATES // 2
+    default_journey_id = journey_ids[mid_gate]
+    default_stage_id = approach_wp_ids[mid_gate]
 
     return (sim, gates, walkable, vis_obstacles, gate_openings,
             approach_wp_ids, approach_wp_grid, post_gate_wp_ids,
             journey_ids, journey_grid, post_journey_ids,
-            default_out_gate, default_in_gate,
-            exit_upper, exit_lower, stair_exits)
+            default_journey_id, default_stage_id,
+            exit_upper, exit_lower)
 
 
 # =============================================================================
@@ -500,12 +427,8 @@ def run_simulation():
     (sim, gates, walkable, obstacles, gate_openings,
      approach_wp_ids, approach_wp_grid, post_gate_wp_ids,
      journey_ids, journey_grid, post_journey_ids,
-     default_out_gate, default_in_gate,
-     exit_upper, exit_lower, stair_exits) = create_simulation()
-
-    # 방향별 큐 head x좌표 (자주 쓰임)
-    QH_OUT = GATE_X - 0.3
-    QH_IN  = GATE_X + GATE_LENGTH + 0.3
+     default_journey_id, default_stage_id,
+     exit_upper, exit_lower) = create_simulation()
 
     rng = np.random.default_rng(42)
     total_steps = int(SIM_TIME / DT)
@@ -525,10 +448,6 @@ def run_simulation():
         "temperament_counts": {"adventurous": 0, "conserved": 0, "mild": 0},
         "tagless_count": 0,
         "stage3_triggers": 0,
-        "spawned_out": 0,
-        "spawned_in": 0,
-        "passed_out": 0,
-        "passed_in": 0,
     }
 
     # 각 게이트의 서비스 상태 추적
@@ -540,7 +459,7 @@ def run_simulation():
     # 소프트웨어 큐: 게이트별 FIFO 리스트 (agent_id 저장)
     sw_queue = [[] for _ in range(N_GATES)]
     last_queue_entry_time = [-999.0] * N_GATES  # 게이트별 마지막 큐 진입 시각
-    QUEUE_ENTRY_MIN_GAP = 0.7  # 큐 진입 최소 간격 (초) — 줄 서는 동작 시간
+    QUEUE_ENTRY_MIN_GAP = 0.5  # 큐 진입 최소 간격 (초) — 1명 줄 서는 시간
 
     video_frames = []
     frame_interval = int(0.5 / DT)
@@ -556,67 +475,53 @@ def run_simulation():
     for step in range(total_steps):
         current_time = step * DT
 
-        # ── 보행자 생성 (양방향) ──
+        # ── 보행자 생성 (모든 큐 꽉 차면 스폰 지연 = 승강장 대기) ──
         while (arrival_idx < len(arrival_times) and
                arrival_times[arrival_idx][0] <= current_time):
-            arr_time, kind, info = arrival_times[arrival_idx]
+            if all(len(sw_queue[gi]) >= QUEUE_MAX_LENGTH for gi in range(N_GATES)):
+                break
+            arr_time, stair_idx = arrival_times[arrival_idx]
+            stair = STAIRS[stair_idx]
             desired_speed = np.clip(
                 rng.normal(PED_SPEED_MEAN, PED_SPEED_STD),
                 PED_SPEED_MIN, PED_SPEED_MAX)
+
             temperament = assign_temperament(rng)
             is_tagless = rng.random() < TAGLESS_RATIO
-            gate_queue = [len(q) for q in sw_queue]
 
-            allowed = OUTBOUND_GATES if kind == 'out' else INBOUND_GATES
-            default_gate_idx = default_out_gate if kind == 'out' else default_in_gate
+            # 예상 큐 길이 = 현재 큐 + 해당 게이트로 향하는 중인 에이전트 수
+            # (다른 보행자가 어느 게이트로 가는지 관찰하여 예측)
+            gate_queue = [len(q) for q in sw_queue]
+            for _ad in agent_data.values():
+                if _ad.get("serviced") or _ad.get("queued"):
+                    continue
+                _gi = _ad.get("gate_idx", -1)
+                if _gi >= 0:
+                    gate_queue[_gi] += 1
 
             spawned = False
             for retry in range(5):
-                if kind == 'out':
-                    stair = STAIRS[info]
-                    spawn_x = stair["x"] + rng.uniform(0.5, 2.5)
-                    spawn_y = rng.uniform(stair["y_start"], stair["y_end"])
-                    if retry > 0:
-                        spawn_x += rng.uniform(0.5, 2.0)
-                        spawn_y += rng.uniform(-1.0, 1.0)
-                        spawn_y = np.clip(spawn_y, 2.0, NOTCH_Y - 2.0)
-                    dist_to_gate = GATE_X - spawn_x   # 양수: 게이트 왼쪽
-                else:  # 'in' 승차류 — 출구 통로 안에서 spawn
-                    exit_idx = info  # 0=upper(y=24), 1=lower(y=3)
-                    ex = EXITS[exit_idx]
-                    # 통로 중심/폭
-                    ecx = (ex['x_start'] + ex['x_end']) / 2  # 27.5
-                    euw = EXIT_STAIR_WIDTH / 2                 # 1.25
-                    # 통로 x범위 안에서 spawn
-                    spawn_x = rng.uniform(ecx - euw + 0.3, ecx + euw - 0.3)
-                    # upper: y=[23.5, 24.5], lower: y=[2.5, 3.5]
-                    if exit_idx == 0:
-                        spawn_y = ex['y'] - rng.uniform(0, 0.5)
-                    else:
-                        spawn_y = ex['y'] + rng.uniform(0, 0.5)
-                    if retry > 0:
-                        spawn_x += rng.uniform(-0.2, 0.2)
-                        spawn_x = np.clip(spawn_x, ecx - euw + 0.2, ecx + euw - 0.2)
-                    dist_to_gate = spawn_x - (GATE_X + GATE_LENGTH)
+                spawn_x = stair["x"] + rng.uniform(0.5, 2.5)
+                spawn_y = rng.uniform(stair["y_start"], stair["y_end"])
+                if retry > 0:
+                    spawn_x += rng.uniform(0.5, 2.0)
+                    spawn_y += rng.uniform(-1.0, 1.0)
+                    spawn_y = np.clip(spawn_y, 2.0, NOTCH_Y - 2.0)
 
-                if dist_to_gate <= CHOICE_DIST_1ST:
-                    gate_idx = choose_gate_lrp(
-                        rng, (spawn_x, spawn_y), desired_speed, temperament,
-                        gates, gate_queue, stage="1st", allowed_gates=allowed)
-                    choice_stage = 1
-                    _depth = min(len(sw_queue[gate_idx]), MAX_QUEUE_DEPTH_WP)
-                    jid = journey_grid[gate_idx][_depth]
-                    sid = approach_wp_grid[gate_idx][_depth]
-                else:
-                    gate_idx = -1
-                    choice_stage = 0
-                    jid = journey_grid[default_gate_idx][0]
-                    sid = approach_wp_grid[default_gate_idx][0]
+                # spawn 시 LRP 1회 강제 결정 (재선택 없음)
+                gate_idx = choose_gate_lrp(
+                    rng, (spawn_x, spawn_y), desired_speed, temperament,
+                    gates, gate_queue, stage="1st")
+                choice_stage = 1
+                _depth = min(len(sw_queue[gate_idx]), MAX_QUEUE_DEPTH_WP)
+                jid = journey_grid[gate_idx][_depth]
+                sid = approach_wp_grid[gate_idx][_depth]
 
                 try:
                     agent_id = sim.add_agent(
                         jps.CollisionFreeSpeedModelV2AgentParameters(
-                            journey_id=jid, stage_id=sid,
+                            journey_id=jid,
+                            stage_id=sid,
                             position=(spawn_x, spawn_y),
                             time_gap=CFSM_TIME_GAP,
                             desired_speed=desired_speed,
@@ -628,7 +533,6 @@ def run_simulation():
                         ))
                     agent_data[agent_id] = {
                         "gate_idx": gate_idx,
-                        "kind": kind,                     # 'out' or 'in'
                         "spawn_time": current_time,
                         "service_time": sample_service_time(rng, is_tagless),
                         "original_speed": desired_speed,
@@ -642,37 +546,27 @@ def run_simulation():
                     stats["temperament_counts"][temperament] += 1
                     if is_tagless:
                         stats["tagless_count"] += 1
-                    if kind == 'out':
-                        stats["spawned_out"] += 1
-                    else:
-                        stats["spawned_in"] += 1
                     spawned = True
                     break
                 except Exception:
                     continue
 
             if not spawned:
-                arrival_times.insert(arrival_idx + 1, (current_time + DT * 2, kind, info))
+                arrival_times.insert(arrival_idx + 1, (current_time + DT * 2, stair_idx))
 
             arrival_idx += 1
 
-        # ── 소프트웨어 큐: 접근 구역 도달 에이전트 흡수 (방향별) ──
-        # tail 스냅샷 (방향에 따라 좌/우)
+        # ── 소프트웨어 큐: 접근 구역 도달 에이전트 제거 (sim.iterate 전) ──
+        # 스텝 시작 시 큐 tail 위치 스냅샷 (연쇄 진입 방지)
         queue_tail_snap = []
         for gi in range(N_GATES):
-            d = GATE_DIRECTIONS[gi]
             n_q = len(sw_queue[gi])
-            if d == 'out':
-                if n_q == 0:
-                    queue_tail_snap.append(QH_OUT - 0.8)
-                else:
-                    queue_tail_snap.append(QH_OUT - n_q * QUEUE_SPACING - 0.8)
+            if n_q == 0:
+                queue_tail_snap.append(QUEUE_HEAD_X - 0.8)  # 빈 큐: 0.8m 뒤에서 흡수
             else:
-                if n_q == 0:
-                    queue_tail_snap.append(QH_IN + 0.8)
-                else:
-                    queue_tail_snap.append(QH_IN + n_q * QUEUE_SPACING + 0.8)
+                queue_tail_snap.append(QUEUE_HEAD_X - n_q * QUEUE_SPACING - 0.8)
 
+        # queue_tail을 지나친 에이전트 전부 수집 (게이트별, px 내림차순)
         gate_candidates = [[] for _ in range(N_GATES)]
         for agent in list(sim.agents()):
             aid = agent.id
@@ -685,50 +579,28 @@ def run_simulation():
             gi = ad["gate_idx"]
             if gi < 0:
                 continue
-            if len(sw_queue[gi]) >= QUEUE_MAX_LENGTH:
-                continue
-            d = GATE_DIRECTIONS[gi]
-            tail = queue_tail_snap[gi]
-            # out: tail보다 오른쪽(px > tail)에 있으면 흡수
-            # in : tail보다 왼쪽 (px < tail)에 있으면 흡수
-            if (d == 'out' and px > tail) or (d == 'in' and px < tail):
+            if px > queue_tail_snap[gi] and len(sw_queue[gi]) < QUEUE_MAX_LENGTH:
                 gate_candidates[gi].append((px, aid))
 
         for gi in range(N_GATES):
-            d = GATE_DIRECTIONS[gi]
-            gate_candidates[gi].sort(reverse=(d == 'out'))
-            absorbed_this_step = 0
+            gate_candidates[gi].sort(reverse=True)
             for px_c, aid in gate_candidates[gi]:
-                # tail 안쪽(게이트 쪽) 여부 판단
-                tail = queue_tail_snap[gi]
-                if d == 'out':
-                    past_tail = px_c > tail + 0.5  # tail보다 0.5m 이상 게이트 쪽
-                else:
-                    past_tail = px_c < tail - 0.5
-                # 시간 제한: tail 근처면 0.7초 간격 / tail 안쪽이면 즉시 (단, 스텝당 1명)
-                if past_tail:
-                    if absorbed_this_step >= 1:
-                        continue  # 스텝당 1명만 (폭발 방지)
-                else:
-                    if len(sw_queue[gi]) > 0 and current_time - last_queue_entry_time[gi] < QUEUE_ENTRY_MIN_GAP:
-                        break
+                # 시간 기반 제한: 빈 큐면 즉시, 아니면 0.5초 간격
+                if len(sw_queue[gi]) > 0 and current_time - last_queue_entry_time[gi] < QUEUE_ENTRY_MIN_GAP:
+                    break
                 ad = agent_data[aid]
                 ad["queued"] = True
                 ad["queue_enter_time"] = current_time
                 sw_queue[gi].append(aid)
+                # 시각화: 현재 위치(px_c)에서 슬롯까지 ease-in 보간 (역행 점프 방지)
                 _slot = len(sw_queue[gi]) - 1
-                if d == 'out':
-                    _qx = QH_OUT - _slot * QUEUE_SPACING
-                else:
-                    _qx = QH_IN + _slot * QUEUE_SPACING
-                # 진입 ease: 자유보행 마지막 위치(px_c)에서 슬롯까지 보간
+                _qx = QUEUE_HEAD_X - _slot * QUEUE_SPACING
                 ad["queue_visual_x"] = px_c
                 ad["queue_target_x"] = _qx
                 ad["queue_shift_from"] = px_c
                 ad["queue_shift_start"] = current_time
                 sim.mark_agent_for_removal(aid)
                 last_queue_entry_time[gi] = current_time
-                absorbed_this_step += 1
 
         # ── 소프트웨어 큐 서비스 처리 ──
         for gi in range(N_GATES):
@@ -744,19 +616,14 @@ def run_simulation():
                 if current_time - svc["start"] >= svc["duration"]:
                     aid_done = svc["agent_id"]
                     ad = agent_data[aid_done]
+                    # 게이트 출구에 에이전트 재투입
                     gate_y = gates[gi]["y"]
-                    d = GATE_DIRECTIONS[gi]
-                    # 재투입 좌표: out=게이트 우측, in=게이트 좌측
-                    if d == 'out':
-                        respawn_pos = (GATE_X + GATE_LENGTH + 0.3, gate_y)
-                    else:
-                        respawn_pos = (GATE_X - 0.3, gate_y)
                     try:
                         new_aid = sim.add_agent(
                             jps.CollisionFreeSpeedModelV2AgentParameters(
                                 journey_id=post_journey_ids[gi],
                                 stage_id=post_gate_wp_ids[gi],
-                                position=respawn_pos,
+                                position=(GATE_X + GATE_LENGTH + 0.3, gate_y),
                                 time_gap=CFSM_TIME_GAP,
                                 desired_speed=ad["original_speed"],
                                 radius=CFSM_RADIUS,
@@ -765,15 +632,12 @@ def run_simulation():
                                 strength_geometry_repulsion=5.0,
                                 range_geometry_repulsion=0.02,
                             ))
+                        # 새 ID에 기존 데이터 매핑
                         agent_data[new_aid] = ad
                         ad["serviced"] = True
                         passed_agents.add(aid_done)
                         stats["service_times"].append(svc["duration"])
                         stats["gate_counts"][gi] += 1
-                        if d == 'out':
-                            stats["passed_out"] += 1
-                        else:
-                            stats["passed_in"] += 1
                     except Exception:
                         pass
                     gate_service[gi] = {"clearing": True, "clear_start": current_time}
@@ -783,35 +647,31 @@ def run_simulation():
             if sw_queue[gi]:
                 head_aid = sw_queue[gi].pop(0)
                 ad = agent_data[head_aid]
+                # 태그/태그리스 공통: 서비스 시작 (서비스 시간은 sample_service_time에서 결정)
                 gate_service[gi] = {
                     "agent_id": head_aid,
                     "start": current_time,
                     "duration": ad["service_time"],
                 }
-                # 큐 시프트 모션: 남은 사람들의 타깃을 한 칸씩 앞으로 (방향별)
-                d = GATE_DIRECTIONS[gi]
-                qh = QH_OUT if d == 'out' else QH_IN
-                sign = -1 if d == 'out' else +1
+                # 큐 시프트 모션: 남은 사람들의 타깃을 한 칸씩 앞으로
                 for _j, _qaid in enumerate(sw_queue[gi]):
                     _qad = agent_data.get(_qaid)
                     if _qad is None:
                         continue
-                    _new_target = qh + sign * _j * QUEUE_SPACING
+                    _new_target = QUEUE_HEAD_X - _j * QUEUE_SPACING
                     if abs(_new_target - _qad.get("queue_target_x", _new_target)) > 1e-6:
                         _qad["queue_shift_from"] = _qad.get("queue_visual_x", _new_target)
                         _qad["queue_target_x"] = _new_target
                         _qad["queue_shift_start"] = current_time
 
-        # ── 대기열 내 LRP 재선택 (방향별 분리) ──
+        # ── 대기열 내 LRP 재선택 ──
         if QUEUE_RESELECT_ENABLED and step % int(QUEUE_RESELECT_INTERVAL / DT) == 0:
             gate_queue_snap = [len(q) for q in sw_queue]
             for gi in range(N_GATES):
                 if gate_queue_snap[gi] < QUEUE_RESELECT_MIN_QUEUE:
                     continue
-                d = GATE_DIRECTIONS[gi]
-                allowed = OUTBOUND_GATES if d == 'out' else INBOUND_GATES
-                qh = QH_OUT if d == 'out' else QH_IN
-                sign = -1 if d == 'out' else +1
+                # head(서비스 직전)는 제외, 뒤에서부터 검토
+                # 게이트당 1명만 이동 (동시 대량 이탈 방지)
                 moved = False
                 candidates = list(sw_queue[gi][1:])
                 for qaid in candidates:
@@ -820,88 +680,40 @@ def run_simulation():
                     ad = agent_data.get(qaid)
                     if not ad:
                         continue
+                    # LRP로 최적 게이트 판단 (현재 큐 위치 기준)
                     q_pos_idx = sw_queue[gi].index(qaid)
-                    # 내 현재 큐 위치 (x좌표)
-                    my_qx = qh + sign * q_pos_idx * QUEUE_SPACING
+                    qx = GATE_X - 0.3 - q_pos_idx * 0.5
                     gate_y = gates[gi]["y"]
-
-                    # 인접 게이트 중 새 큐 tail이 나보다 게이트에 가까운지 확인
                     new_gate = choose_gate_lrp(
-                        rng, (my_qx, gate_y), ad["original_speed"],
-                        ad["temperament"], gates, gate_queue_snap, stage="2nd",
-                        allowed_gates=allowed)
-
-                    if new_gate == gi or abs(new_gate - gi) > 1 or new_gate not in allowed:
-                        continue
-
-                    # 새 게이트 tail 위치
-                    _nd = GATE_DIRECTIONS[new_gate]
-                    _nqh = QH_OUT if _nd == 'out' else QH_IN
-                    _nsign = -1 if _nd == 'out' else +1
-                    _n_tail_x = _nqh + _nsign * gate_queue_snap[new_gate] * QUEUE_SPACING
-
-                    # 핵심 조건: 새 tail이 나보다 게이트에 가까운가?
-                    # out: tail_x > my_qx (x가 클수록 게이트 가까움)
-                    # in:  tail_x < my_qx (x가 작을수록 게이트 가까움)
-                    if d == 'out':
-                        better = _n_tail_x > my_qx + 0.3  # 최소 0.3m는 앞서야
-                    else:
-                        better = _n_tail_x < my_qx - 0.3
-
-                    if not better:
-                        continue
-
-                    # ── jockeying 실행: 큐에서 빠져나와 자유보행으로 재투입 ──
-                    sw_queue[gi].remove(qaid)
-                    ad["gate_idx"] = new_gate
-                    ad["queued"] = False  # 자유보행 상태로 전환
-                    stats["reroute_count"] += 1
-
-                    # JuPedSim에 자유보행 에이전트로 재투입
-                    # 현재 큐 위치에서 spawn → 새 게이트의 동적 wp로 이동
-                    _spawn_x = ad.get("queue_visual_x", my_qx)
-                    _spawn_y = gate_y
-                    _new_depth = min(gate_queue_snap[new_gate], MAX_QUEUE_DEPTH_WP)
-                    try:
-                        new_aid = sim.add_agent(
-                            jps.CollisionFreeSpeedModelV2AgentParameters(
-                                journey_id=journey_grid[new_gate][_new_depth],
-                                stage_id=approach_wp_grid[new_gate][_new_depth],
-                                position=(_spawn_x, _spawn_y),
-                                time_gap=CFSM_TIME_GAP,
-                                desired_speed=ad["original_speed"],
-                                radius=CFSM_RADIUS,
-                                strength_neighbor_repulsion=8.0,
-                                range_neighbor_repulsion=0.1,
-                                strength_geometry_repulsion=5.0,
-                                range_geometry_repulsion=0.02,
-                            ))
-                        # 기존 데이터 연결 (새 ID)
-                        agent_data[new_aid] = ad
-                        ad["target_depth"] = _new_depth
-                    except Exception:
-                        # 재투입 실패 시 원래 큐로 복귀
-                        sw_queue[gi].insert(q_pos_idx, qaid)
-                        ad["gate_idx"] = gi
-                        ad["queued"] = True
-                        stats["reroute_count"] -= 1
-                        continue
-
-                    # 떠나는 게이트의 잔류 인원 시프트
-                    for _j, _qaid in enumerate(sw_queue[gi]):
-                        _qad = agent_data.get(_qaid)
-                        if _qad is None:
-                            continue
-                        _new_target = qh + sign * _j * QUEUE_SPACING
-                        if abs(_new_target - _qad.get("queue_target_x", _new_target)) > 1e-6:
-                            _qad["queue_shift_from"] = _qad.get("queue_visual_x", _new_target)
-                            _qad["queue_target_x"] = _new_target
-                            _qad["queue_shift_start"] = current_time
-
-                    # 스냅샷 업데이트
-                    gate_queue_snap[gi] -= 1
-                    # 새 큐에는 아직 안 들어감 (자유보행 → tail 도달 후 정상 흡수)
-                    moved = True
+                        rng, (qx, gate_y), ad["original_speed"],
+                        ad["temperament"], gates, gate_queue_snap, stage="2nd")
+                    if (new_gate != gi and
+                            abs(new_gate - gi) <= 1 and          # 인접 게이트만 (jockeying)
+                            gate_queue_snap[new_gate] < gate_queue_snap[gi] - QUEUE_RESELECT_MIN_DIFF):
+                        sw_queue[gi].remove(qaid)
+                        sw_queue[new_gate].append(qaid)
+                        ad["gate_idx"] = new_gate
+                        stats["reroute_count"] += 1
+                        # 큐 시프트 모션: 떠나는 게이트의 잔류 인원 앞당김
+                        for _j, _qaid in enumerate(sw_queue[gi]):
+                            _qad = agent_data.get(_qaid)
+                            if _qad is None:
+                                continue
+                            _new_target = QUEUE_HEAD_X - _j * QUEUE_SPACING
+                            if abs(_new_target - _qad.get("queue_target_x", _new_target)) > 1e-6:
+                                _qad["queue_shift_from"] = _qad.get("queue_visual_x", _new_target)
+                                _qad["queue_target_x"] = _new_target
+                                _qad["queue_shift_start"] = current_time
+                        # 옮긴 본인: 새 게이트의 마지막 슬롯으로 ease 시작
+                        _new_slot = len(sw_queue[new_gate]) - 1
+                        _new_target = QUEUE_HEAD_X - _new_slot * QUEUE_SPACING
+                        ad["queue_shift_from"] = ad.get("queue_visual_x", _new_target)
+                        ad["queue_target_x"] = _new_target
+                        ad["queue_shift_start"] = current_time
+                        # 스냅샷 업데이트
+                        gate_queue_snap[gi] -= 1
+                        gate_queue_snap[new_gate] += 1
+                        moved = True
 
         # ── 게이트 점유 상태 (재선택용) ──
         gate_occupied = [gate_service[gi] is not None for gi in range(N_GATES)]
@@ -932,70 +744,16 @@ def run_simulation():
 
             px, py = agent.position
             gi = ad["gate_idx"]
-            kind = ad.get("kind", "out")
-            allowed = OUTBOUND_GATES if kind == 'out' else INBOUND_GATES
+            dist_to_gate = GATE_X - px
 
-            # 방향별 dist_to_gate (양수 = 게이트까지 남은 거리)
-            if kind == 'out':
-                dist_to_gate = GATE_X - px
-            else:
-                dist_to_gate = px - (GATE_X + GATE_LENGTH)
-
-            # ── Phase 0: Influence Zone 진입 (1차 선택) ──
-            _cur_gi = ad["gate_idx"] if ad["gate_idx"] >= 0 else allowed[0]
-            if kind == 'out':
-                _dist_from_tail = (GATE_X - queue_tail_snap[_cur_gi]) + 1.5
-            else:
-                _dist_from_tail = (queue_tail_snap[_cur_gi] - (GATE_X + GATE_LENGTH)) + 1.5
-            _dynamic_dist = max(3.0, _dist_from_tail)
-            if ad["choice_stage"] == 0 and dist_to_gate <= _dynamic_dist:
-                gate_idx_new = choose_gate_lrp(
-                    rng, (px, py), ad["original_speed"], ad["temperament"],
-                    gates, gate_queue, stage="1st", allowed_gates=allowed)
-                ad["gate_idx"] = gate_idx_new
-                ad["choice_stage"] = 1
-                _depth = min(gate_queue[gate_idx_new], MAX_QUEUE_DEPTH_WP)
-                ad["target_depth"] = _depth
-                try:
-                    sim.switch_agent_journey(
-                        aid, journey_grid[gate_idx_new][_depth],
-                        approach_wp_grid[gate_idx_new][_depth])
-                except Exception:
-                    pass
-                gi = gate_idx_new
-                continue
-
+            # 1차/2차 자유보행 재선택 제거 — spawn 시 1회 결정만 사용 (DO NOT REVERT)
             if gi < 0:
                 continue
-
             if dist_to_gate <= 0:
                 continue
 
-            current_stage = ad["choice_stage"]
-            current_gate = ad["gate_idx"]
-
-            # ── 2차 재선택 ──
-            if dist_to_gate <= CHOICE_DIST_2ND and current_stage < 2:
-                ad["choice_stage"] = 2
-                if gate_queue[current_gate] >= 3:
-                    new_gate = choose_gate_lrp(
-                        rng, (px, py), ad["original_speed"], ad["temperament"],
-                        gates, gate_queue, stage="2nd", allowed_gates=allowed)
-                    if (new_gate != current_gate and
-                            gate_queue[new_gate] < gate_queue[current_gate] - 2):
-                        _depth = min(gate_queue[new_gate], MAX_QUEUE_DEPTH_WP)
-                        try:
-                            sim.switch_agent_journey(
-                                aid, journey_grid[new_gate][_depth],
-                                approach_wp_grid[new_gate][_depth])
-                            ad["gate_idx"] = new_gate
-                            ad["target_depth"] = _depth
-                            stats["reroute_count"] += 1
-                        except Exception:
-                            pass
-
-        # ── 동적 waypoint 업데이트: 매 스텝 큐 깊이에 맞춰 접근 목표 전환 (방향별) ──
-        if True:
+        # ── 동적 waypoint 업데이트: 큐 깊이 변경 시 접근 목표 전환 ──
+        if step % int(0.5 / DT) == 0:
             for agent in list(sim.agents()):
                 aid = agent.id
                 if aid not in agent_data:
@@ -1006,29 +764,22 @@ def run_simulation():
                 gi = ad["gate_idx"]
                 if gi < 0:
                     continue
-                d = GATE_DIRECTIONS[gi]
-                qh = QH_OUT if d == 'out' else QH_IN
-                sign = -1 if d == 'out' else +1
                 new_depth = min(len(sw_queue[gi]), MAX_QUEUE_DEPTH_WP)
-                # 새 waypoint 위치 (depth=0 → head 0.8m 뒤)
+                # 새 waypoint 위치 계산
                 if new_depth == 0:
-                    wp_x = qh + sign * 0.8
+                    wp_x = QUEUE_HEAD_X - 0.8
                 else:
-                    wp_x = qh + sign * (new_depth * QUEUE_SPACING + 0.8)
-
+                    wp_x = QUEUE_HEAD_X - new_depth * QUEUE_SPACING - 0.8
+                # 이미 waypoint보다 앞에 있으면 역행 방지 → 즉시 흡수
                 px = agent.position[0]
-                # 이미 wp를 지나쳤으면 즉시 흡수
-                #   out: px > wp_x (wp_x가 더 왼쪽) → 게이트 쪽
-                #   in : px < wp_x (wp_x가 더 오른쪽) → 게이트 쪽
-                past_wp = (d == 'out' and px > wp_x) or (d == 'in' and px < wp_x)
-                if past_wp and len(sw_queue[gi]) < QUEUE_MAX_LENGTH:
+                if px > wp_x and len(sw_queue[gi]) < QUEUE_MAX_LENGTH:
                     if current_time - last_queue_entry_time[gi] >= QUEUE_ENTRY_MIN_GAP or len(sw_queue[gi]) == 0:
                         ad["queued"] = True
                         ad["queue_enter_time"] = current_time
                         sw_queue[gi].append(aid)
                         _slot = len(sw_queue[gi]) - 1
-                        _qx = qh + sign * _slot * QUEUE_SPACING
-                        # 진입 ease: 자유보행 위치(px)에서 슬롯까지 보간
+                        _qx = QUEUE_HEAD_X - _slot * QUEUE_SPACING
+                        # 시각화: 현재 위치(px)에서 슬롯까지 ease 보간
                         ad["queue_visual_x"] = px
                         ad["queue_target_x"] = _qx
                         ad["queue_shift_from"] = px
@@ -1036,9 +787,9 @@ def run_simulation():
                         sim.mark_agent_for_removal(aid)
                         last_queue_entry_time[gi] = current_time
                         continue
-                # depth 줄어들기만 허용
+                # 큐 길이 변화 시 wp 갱신 (커지든 작아지든) — 항상 현재 tail로 향하게
                 cur_depth = ad.get("target_depth", new_depth)
-                if new_depth < cur_depth:
+                if new_depth != cur_depth:
                     ad["target_depth"] = new_depth
                     try:
                         sim.switch_agent_journey(
@@ -1065,27 +816,24 @@ def run_simulation():
                         + (ad["queue_target_x"] - ad["queue_shift_from"]) * eased
                     )
 
-        # ── 궤적 기록 (kind 추가) ──
+        # ── 궤적 기록 ──
         if step % traj_interval == 0:
+            # 시뮬레이션 내 활성 에이전트
             for agent in sim.agents():
                 aid = agent.id
                 px, py = agent.position
                 ad = agent_data.get(aid, {})
                 gi = ad.get("gate_idx", -1)
-                kind = ad.get("kind", "out")
                 state = "passed" if ad.get("serviced") else "moving"
-                trajectory_data.append((current_time, aid, px, py, gi, state, kind))
+                trajectory_data.append((current_time, aid, px, py, gi, state))
 
+            # 소프트웨어 큐 내 에이전트 (시각화 위치 = visual_x)
             for gi in range(N_GATES):
                 gate_y = gates[gi]["y"]
-                d = GATE_DIRECTIONS[gi]
-                qh = QH_OUT if d == 'out' else QH_IN
-                sign = -1 if d == 'out' else +1
                 for j, qaid in enumerate(sw_queue[gi]):
                     ad = agent_data.get(qaid, {})
-                    qx = ad.get("queue_visual_x", qh + sign * j * QUEUE_SPACING)
-                    kind = ad.get("kind", "out")
-                    trajectory_data.append((current_time, qaid, qx, gate_y, gi, "queue", kind))
+                    qx = ad.get("queue_visual_x", QUEUE_HEAD_X - j * QUEUE_SPACING)
+                    trajectory_data.append((current_time, qaid, qx, gate_y, gi, "queue"))
 
         # ── 통계 & 프레임 ──
         if step % int(1.0 / DT) == 0:
@@ -1094,31 +842,26 @@ def run_simulation():
 
         if step % frame_interval == 0:
             frame_data = []
+            # 시뮬레이션 내 활성 에이전트
             for a in sim.agents():
                 ad = agent_data.get(a.id, {})
                 s = "passed" if ad.get("serviced") else "approach"
                 tl = ad.get("is_tagless", False)
-                kind = ad.get("kind", "out")
-                frame_data.append((a.position[0], a.position[1], s, tl, kind))
+                frame_data.append((a.position[0], a.position[1], s, tl))
 
+            # 소프트웨어 큐 에이전트 (시각화 위치 = visual_x, ease 적용)
             for gi in range(N_GATES):
                 gate_y = gates[gi]["y"]
-                d = GATE_DIRECTIONS[gi]
-                qh = QH_OUT if d == 'out' else QH_IN
-                sign = -1 if d == 'out' else +1
                 for j, qaid in enumerate(sw_queue[gi]):
                     ad = agent_data.get(qaid, {})
-                    qx = ad.get("queue_visual_x", qh + sign * j * QUEUE_SPACING)
+                    qx = ad.get("queue_visual_x", QUEUE_HEAD_X - j * QUEUE_SPACING)
                     tl = ad.get("is_tagless", False)
-                    kind = ad.get("kind", "out")
-                    frame_data.append((qx, gate_y, "queue", tl, kind))
+                    frame_data.append((qx, gate_y, "queue", tl))
+                # 서비스 중 에이전트 (게이트 head에 표시)
                 if gate_service[gi] is not None and "agent_id" in gate_service[gi]:
                     svc_aid = gate_service[gi]["agent_id"]
-                    sad = agent_data.get(svc_aid, {})
-                    tl = sad.get("is_tagless", False)
-                    kind = sad.get("kind", "out")
-                    head_x = (GATE_X - 0.1) if kind == 'out' else (GATE_X + GATE_LENGTH + 0.1)
-                    frame_data.append((head_x, gate_y, "service", tl, kind))
+                    tl = agent_data.get(svc_aid, {}).get("is_tagless", False)
+                    frame_data.append((GATE_X - 0.1, gate_y, "service", tl))
 
             video_frames.append((current_time, frame_data))
 
@@ -1161,15 +904,14 @@ def run_simulation():
             queued_total = sum(len(q) for q in sw_queue)
             print(f"  t={current_time:.0f}s | agents: {sim.agent_count()} "
                   f"| queued: {queued_total} "
-                  f"| out: spawn {stats['spawned_out']}/pass {stats['passed_out']}"
-                  f"  in: spawn {stats['spawned_in']}/pass {stats['passed_in']} "
-                  f"| re-route: {stats['reroute_count']}")
+                  f"| spawned: {spawned_count} | passed: {sum(stats['gate_counts'])} "
+                  f"| re-route: {stats['reroute_count']} "
+                  f"| 3rd: {stats['stage3_triggers']}")
 
     # ── 결과 ──
     total_passed = sum(stats["gate_counts"])
-    print(f"\n완료: 하차 {stats['spawned_out']}/{stats['passed_out']}, "
-          f"승차 {stats['spawned_in']}/{stats['passed_in']}, "
-          f"경로변경 {stats['reroute_count']}회")
+    print(f"\n완료: {spawned_count}명 생성, {total_passed}명 통과, "
+          f"{stats['reroute_count']}회 경로변경")
     print(f"  태그리스: {stats['tagless_count']}명 "
           f"({stats['tagless_count']/max(spawned_count,1)*100:.1f}%)")
     print(f"  성격: {stats['temperament_counts']}")
@@ -1259,16 +1001,13 @@ def draw_frame(ax, positions, gates, obstacles, gate_openings, time_sec):
                 ox, oy = geom.exterior.xy
                 ax.fill(ox, oy, color='#546E7A', edgecolor='#263238', linewidth=0.3)
 
-    for j, opening in enumerate(gate_openings):
+    for opening in gate_openings:
         ox, oy = opening.exterior.xy
-        # 방향별 게이트 색상: 입구=teal, 출구=green
-        gate_color = '#26A69A' if GATE_DIRECTIONS[j] == 'in' else '#66BB6A'
-        ax.fill(ox, oy, color=gate_color, edgecolor='#2E7D32', linewidth=0.8, alpha=0.5, zorder=3)
+        ax.fill(ox, oy, color='#66BB6A', edgecolor='#2E7D32', linewidth=0.8, alpha=0.5, zorder=3)
 
-    for j, g in enumerate(gates):
-        label = f"{g['id']+1}{'입' if GATE_DIRECTIONS[j]=='in' else '출'}"
-        ax.text(g["x"] + GATE_LENGTH / 2, g["y"], label,
-                ha='center', va='center', fontsize=6, fontweight='bold', color='#1B5E20', zorder=4)
+    for g in gates:
+        ax.text(g["x"] + GATE_LENGTH / 2, g["y"], str(g["id"] + 1),
+                ha='center', va='center', fontsize=7, fontweight='bold', color='#1B5E20', zorder=4)
 
     for stair in STAIRS:
         ax.plot([stair["x"], stair["x"]],
@@ -1290,21 +1029,18 @@ def draw_frame(ax, positions, gates, obstacles, gate_openings, time_sec):
             hatch='///', alpha=0.4))
 
     if positions:
-        # 5튜플 (x, y, state, is_tagless, kind) — 양방향 색상
-        xs = [p[0] for p in positions]
-        ys = [p[1] for p in positions]
-        cs = []
-        for p in positions:
-            state = p[2]
-            kind = p[4] if len(p) >= 5 else 'out'
-            if state == 'queue':
-                cs.append('#EF6C00')   # 큐 = 오렌지 (방향 무관)
-            elif state == 'service':
-                cs.append('#C62828')   # 서비스 = 빨강
-            elif kind == 'in':
-                cs.append('#00897B')   # 승차 = teal
-            else:
-                cs.append('#1565C0')   # 하차 = 파랑
+        if len(positions[0]) >= 4:
+            # (x, y, state, is_tagless) 4튜플
+            xs = [p[0] for p in positions]
+            ys = [p[1] for p in positions]
+            cs = [TAGLESS_COLORS.get(p[2], "#00BFA5") if p[3] else STATE_COLORS.get(p[2], "#1565C0") for p in positions]
+        elif len(positions[0]) == 3:
+            xs = [p[0] for p in positions]
+            ys = [p[1] for p in positions]
+            cs = [STATE_COLORS.get(p[2], "#1565C0") for p in positions]
+        else:
+            xs, ys = zip(*positions)
+            cs = '#1565C0'
         ax.scatter(xs, ys, s=25, c=cs, edgecolors='white',
                    linewidths=0.3, alpha=0.85, zorder=5)
 
@@ -1335,9 +1071,9 @@ def create_snapshots(frames, gates, obstacles, gate_openings):
     fig.suptitle('성수역 서쪽 대합실 (CFSM V2, 소프트웨어 큐)',
                  fontsize=16, fontweight='bold')
     fig.tight_layout()
-    fig.savefig(OUTPUT_DIR / "snapshots_bidir.png", dpi=150, bbox_inches='tight')
+    fig.savefig(OUTPUT_DIR / "snapshots_cfsm.png", dpi=150, bbox_inches='tight')
     plt.close(fig)
-    print(f"  스냅샷: {OUTPUT_DIR / 'snapshots_bidir.png'}")
+    print(f"  스냅샷: {OUTPUT_DIR / 'snapshots_cfsm.png'}")
 
 
 def create_mp4(frames, gates, obstacles, gate_openings):
@@ -1355,7 +1091,7 @@ def create_mp4(frames, gates, obstacles, gate_openings):
                      fontsize=12, fontweight='bold')
 
     anim = FuncAnimation(fig, animate, frames=len(target_frames), interval=100)
-    mp4_path = OUTPUT_DIR / "simulation_bidir.mp4"
+    mp4_path = OUTPUT_DIR / "simulation_cfsm.mp4"
     ffmpeg_path = imageio_ffmpeg.get_ffmpeg_exe()
     plt.rcParams['animation.ffmpeg_path'] = ffmpeg_path
     writer = FFMpegWriter(fps=10, bitrate=2000,
@@ -1366,12 +1102,12 @@ def create_mp4(frames, gates, obstacles, gate_openings):
 
 
 def save_trajectories(trajectory_data):
-    """궤적 데이터를 CSV로 저장 (kind 컬럼 추가)"""
+    """궤적 데이터를 CSV로 저장"""
     import csv
-    traj_path = OUTPUT_DIR / "trajectories_bidir.csv"
+    traj_path = OUTPUT_DIR / "trajectories.csv"
     with open(traj_path, 'w', newline='') as f:
         w = csv.writer(f)
-        w.writerow(["time", "agent_id", "x", "y", "gate_idx", "state", "kind"])
+        w.writerow(["time", "agent_id", "x", "y", "gate_idx", "state"])
         for row in trajectory_data:
             w.writerow(row)
     print(f"  궤적: {traj_path} ({len(trajectory_data)}행)")
@@ -1385,7 +1121,7 @@ def analyze_trajectories(trajectory_data, gates):
 
     import pandas as pd
     df = pd.DataFrame(trajectory_data,
-                      columns=["time", "agent_id", "x", "y", "gate_idx", "state", "kind"])
+                      columns=["time", "agent_id", "x", "y", "gate_idx", "state"])
 
     issues = []
 
@@ -1492,9 +1228,9 @@ def plot_queue_history(queue_history):
     ax.legend()
     ax.grid(True, alpha=0.3)
     fig.tight_layout()
-    fig.savefig(OUTPUT_DIR / "queue_history_bidir.png", dpi=150)
+    fig.savefig(OUTPUT_DIR / "queue_history_cfsm.png", dpi=150)
     plt.close(fig)
-    print(f"  대기열: {OUTPUT_DIR / 'queue_history_bidir.png'}")
+    print(f"  대기열: {OUTPUT_DIR / 'queue_history_cfsm.png'}")
 
 
 def plot_service_time_dist(service_times):
@@ -1510,9 +1246,9 @@ def plot_service_time_dist(service_times):
     ax.legend()
     ax.grid(True, alpha=0.3)
     fig.tight_layout()
-    fig.savefig(OUTPUT_DIR / "service_time_bidir.png", dpi=150)
+    fig.savefig(OUTPUT_DIR / "service_time_cfsm.png", dpi=150)
     plt.close(fig)
-    print(f"  서비스시간: {OUTPUT_DIR / 'service_time_bidir.png'}")
+    print(f"  서비스시간: {OUTPUT_DIR / 'service_time_cfsm.png'}")
 
 
 # =============================================================================

@@ -42,11 +42,16 @@ BARRIER_Y_BOTTOM = 3.0
 BARRIER_Y_TOP = 22.0
 
 # =============================================================================
-# 3. 계단 (보행자 출발선)
+# 3. 계단 (보행자 출발 통로, 2026-04-18 공간 확장 v4)
+# 대합실 = 승강장 2D 겹침. 계단은 가로 통로로 표현 (x=1~11, 10m).
+# spawn: x_end (x=11, 승강장쪽 끝) → 계단 내부 x↓ → x_start (x=1, 연결부)
+# 'x' 필드는 하위 호환 (= x_start)
 # =============================================================================
 STAIRS = [
-    {"id": "upper", "x": 1.0, "y_start": 15.0, "y_end": 18.0},
-    {"id": "lower", "x": 1.0, "y_start": 8.0,  "y_end": 11.0},
+    {"id": "upper", "x": 1.0, "x_start": 1.0, "x_end": 11.0,
+     "y_start": 15.0, "y_end": 18.0},
+    {"id": "lower", "x": 1.0, "x_start": 1.0, "x_end": 11.0,
+     "y_start": 8.0,  "y_end": 11.0},
 ]
 
 # =============================================================================
@@ -55,6 +60,31 @@ STAIRS = [
 EXITS = [
     {"id": "upper", "x_start": 27.0, "x_end": 28.0, "y": 24.0},
     {"id": "lower", "x_start": 27.0, "x_end": 28.0, "y": 3.0},
+]
+
+# =============================================================================
+# 4-b. 에스컬레이터 통로 (2026-04-18 공간 확장)
+# 대합실 북쪽 벽(y=25)에 에스컬 4번(용답), 남쪽 벽(y=0)에 에스컬 1번(뚝섬)
+# 모두 x=25~35 가로 통로, 폭 1m. 입구는 각 (25, 25) / (25, 0).
+# =============================================================================
+ESCALATOR_CORRIDOR_LEN = 10.0   # x 방향 길이 (m)
+ESCALATOR_CORRIDOR_WIDTH = 1.0  # y 방향 폭 (m)
+ESCALATOR_X_START = 25.0
+ESCALATOR_X_END = ESCALATOR_X_START + ESCALATOR_CORRIDOR_LEN  # 35.0
+
+ESCALATORS = [
+    # 출구 1번 (뚝섬방면, 남쪽)
+    {"id": "exit1", "direction": "뚝섬",
+     "x_range": (ESCALATOR_X_START, ESCALATOR_X_END),
+     "y_range": (-ESCALATOR_CORRIDOR_WIDTH, 0.0),
+     "entry": (ESCALATOR_X_START, 0.0),
+     "sink_x": ESCALATOR_X_END},
+    # 출구 4번 (용답방면, 북쪽)
+    {"id": "exit4", "direction": "용답",
+     "x_range": (ESCALATOR_X_START, ESCALATOR_X_END),
+     "y_range": (CONCOURSE_WIDTH, CONCOURSE_WIDTH + ESCALATOR_CORRIDOR_WIDTH),
+     "entry": (ESCALATOR_X_START, CONCOURSE_WIDTH),
+     "sink_x": ESCALATOR_X_END},
 ]
 
 # =============================================================================
@@ -121,11 +151,19 @@ def build_geometry(gates, include_barrier=True, passage_width_override=None,
     """
     bt = barrier_thickness if barrier_thickness else GATE_LENGTH
 
-    # 외곽 경계 (상단 왼쪽 들여쓰기 포함)
+    # 외곽 경계 (상단 왼쪽 들여쓰기 + 남/북쪽 에스컬레이터 통로 돌출)
     outer = Polygon([
         (0, 0),
+        (ESCALATOR_X_START, 0),                                 # 에스컬 1 서쪽 진입
+        (ESCALATOR_X_START, -ESCALATOR_CORRIDOR_WIDTH),         # 에스컬 1 남서
+        (ESCALATOR_X_END, -ESCALATOR_CORRIDOR_WIDTH),           # 에스컬 1 남동
+        (ESCALATOR_X_END, 0),                                   # 에스컬 1 복귀
         (CONCOURSE_LENGTH, 0),
         (CONCOURSE_LENGTH, CONCOURSE_WIDTH),
+        (ESCALATOR_X_END, CONCOURSE_WIDTH),                     # 에스컬 4 동쪽 진입
+        (ESCALATOR_X_END, CONCOURSE_WIDTH + ESCALATOR_CORRIDOR_WIDTH),
+        (ESCALATOR_X_START, CONCOURSE_WIDTH + ESCALATOR_CORRIDOR_WIDTH),
+        (ESCALATOR_X_START, CONCOURSE_WIDTH),                   # 에스컬 4 복귀
         (NOTCH_X, CONCOURSE_WIDTH),
         (NOTCH_X, NOTCH_Y),
         (0, NOTCH_Y),
@@ -209,27 +247,57 @@ def plot_station(gates, obstacles, gate_openings, save_path=None):
         ax.text(g["x"] + GATE_LENGTH / 2, g["y"], str(i + 1),
                 ha='center', va='center', fontsize=8, fontweight='bold', color='#1B5E20')
 
-    # 계단 (빨강 선)
+    # 계단 (가로 통로 — 승강장 겹침)
     for stair in STAIRS:
-        ax.plot([stair["x"], stair["x"]],
-                [stair["y_start"], stair["y_end"]],
-                color='red', linewidth=4, solid_capstyle='round', label=f'계단 ({stair["id"]})')
-        ax.text(stair["x"] - 0.5, (stair["y_start"] + stair["y_end"]) / 2,
-                f'계단\n({stair["id"]})', ha='right', va='center',
-                fontsize=8, color='red', fontweight='bold')
+        xs_s, xs_e = stair["x_start"], stair["x_end"]
+        ys_s, ys_e = stair["y_start"], stair["y_end"]
+        rect = mpatches.Rectangle(
+            (xs_s, ys_s), xs_e - xs_s, ys_e - ys_s,
+            facecolor='#FFCCBC', edgecolor='#D84315', linewidth=1.5, alpha=0.6)
+        ax.add_patch(rect)
+        ax.text((xs_s + xs_e) / 2, (ys_s + ys_e) / 2,
+                f'계단 ({stair["id"]})\nx={xs_s:.0f}~{xs_e:.0f}',
+                ha='center', va='center', fontsize=9,
+                color='#D84315', fontweight='bold')
+        # spawn 위치 마커 (승강장쪽 끝)
+        ax.plot(xs_e, (ys_s + ys_e) / 2, 'o', color='#0288D1', markersize=8)
+        # 연결부 (x_start, 대합실쪽)
+        ax.plot([xs_s, xs_s], [ys_s, ys_e],
+                color='#D84315', linewidth=3, solid_capstyle='round')
 
-    # 출구 (파랑 선)
-    for exit_ in EXITS:
-        ax.plot([exit_["x_start"], exit_["x_end"]],
-                [exit_["y"], exit_["y"]],
-                color='blue', linewidth=4, solid_capstyle='round')
-        ax.text((exit_["x_start"] + exit_["x_end"]) / 2, exit_["y"] + 0.5 * (1 if exit_["id"] == "lower" else -1),
-                f'출구 ({exit_["id"]})', ha='center', va='center',
-                fontsize=8, color='blue', fontweight='bold')
+    # 에스컬레이터 통로 + 입구/sink
+    for esc in ESCALATORS:
+        xs_s, xs_e = esc["x_range"]
+        ys_s, ys_e = esc["y_range"]
+        rect = mpatches.Rectangle(
+            (xs_s, ys_s), xs_e - xs_s, ys_e - ys_s,
+            facecolor='#C8E6C9', edgecolor='#2E7D32', linewidth=1.5, alpha=0.8)
+        ax.add_patch(rect)
+        ax.text((xs_s + xs_e) / 2, (ys_s + ys_e) / 2,
+                f'에스컬 {esc["id"]}\n({esc["direction"]})',
+                ha='center', va='center', fontsize=8,
+                color='#2E7D32', fontweight='bold')
+        # 입구 (대합실쪽)
+        ex, ey = esc["entry"]
+        ax.plot(ex, ey, 'o', color='blue', markersize=9)
+        # sink (외부 출구)
+        ax.plot([esc["sink_x"], esc["sink_x"]], [ys_s, ys_e],
+                color='blue', linewidth=3)
 
-    # 외곽 벽
-    outer_x = [0, CONCOURSE_LENGTH, CONCOURSE_LENGTH, NOTCH_X, NOTCH_X, 0, 0]
-    outer_y = [0, 0, CONCOURSE_WIDTH, CONCOURSE_WIDTH, NOTCH_Y, NOTCH_Y, 0]
+    # 외곽 벽 (에스컬 돌출 + 상단 왼쪽 들여쓰기 반영)
+    outer_x = [
+        0, ESCALATOR_X_START, ESCALATOR_X_START, ESCALATOR_X_END,
+        ESCALATOR_X_END, CONCOURSE_LENGTH, CONCOURSE_LENGTH,
+        ESCALATOR_X_END, ESCALATOR_X_END, ESCALATOR_X_START,
+        ESCALATOR_X_START, NOTCH_X, NOTCH_X, 0, 0,
+    ]
+    outer_y = [
+        0, 0, -ESCALATOR_CORRIDOR_WIDTH, -ESCALATOR_CORRIDOR_WIDTH,
+        0, 0, CONCOURSE_WIDTH,
+        CONCOURSE_WIDTH, CONCOURSE_WIDTH + ESCALATOR_CORRIDOR_WIDTH,
+        CONCOURSE_WIDTH + ESCALATOR_CORRIDOR_WIDTH, CONCOURSE_WIDTH,
+        CONCOURSE_WIDTH, NOTCH_Y, NOTCH_Y, 0,
+    ]
     ax.plot(outer_x, outer_y, color='#E65100', linewidth=2)
 
     # 비통행 구조물 빗금 (visible=False 제외 — 숨겨진 내부 장치)
@@ -260,16 +328,18 @@ def plot_station(gates, obstacles, gate_openings, save_path=None):
             ha='center', fontsize=10, color='#E65100', fontweight='bold', alpha=0.7)
 
     ax.set_xlim(-1, CONCOURSE_LENGTH + 1)
-    ax.set_ylim(-1, CONCOURSE_WIDTH + 1)
+    ax.set_ylim(-ESCALATOR_CORRIDOR_WIDTH - 1,
+                CONCOURSE_WIDTH + ESCALATOR_CORRIDOR_WIDTH + 1)
     ax.set_aspect('equal')
     ax.set_xlabel('x (m)')
     ax.set_ylabel('y (m)')
-    ax.set_title('성수역 2F 대합실 (서쪽 50m) - 게이트 레이아웃', fontsize=14, fontweight='bold')
+    ax.set_title('성수역 2F 대합실 (서쪽 50m) — v4 공간 확장 (계단 가로통로 + 에스컬레이터)',
+                 fontsize=13, fontweight='bold')
     ax.grid(True, alpha=0.2, linestyle=':')
 
     plt.tight_layout()
     if save_path:
-        fig.savefig(save_path, dpi=150, bbox_inches='tight')
+        fig.savefig(save_path, dpi=90, bbox_inches='tight')
         print(f"Saved: {save_path}")
     return fig, ax
 

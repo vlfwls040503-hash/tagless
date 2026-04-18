@@ -39,6 +39,7 @@ from seongsu_west_escalator import (
     BARRIER_Y_BOTTOM, BARRIER_Y_TOP,
     CONCOURSE_LENGTH, CONCOURSE_WIDTH, NOTCH_X, NOTCH_Y,
     STAIRS, EXITS, STRUCTURES, N_GATES,
+    ESCALATOR_X_START, ESCALATOR_X_END, ESCALATOR_CORRIDOR_WIDTH,
 )
 
 plt.rcParams['font.family'] = 'Malgun Gothic'
@@ -148,6 +149,21 @@ def ease_in_out(t):
 
 OUTPUT_DIR = pathlib.Path(__file__).parent.parent / "output"
 OUTPUT_DIR.mkdir(exist_ok=True)
+
+# =============================================================================
+# 배치 런 파라미터 (batch_runner가 monkey-patch, 기본값은 기존 동작 유지)
+# =============================================================================
+BATCH_SEED = 42                          # rng 시드
+BATCH_TAGLESS_ONLY_GATES = frozenset()   # 태그리스 전용 게이트 idx. 나머지는 태그 전용
+                                         # 비어있으면 기존 동작 (모든 게이트 공용)
+BATCH_OUTPUT_SUFFIX = ""                 # 출력 파일 suffix (배치 시 시나리오 id)
+BATCH_METRICS_OUT = None                 # pathlib.Path — per-agent CSV 저장 경로
+BATCH_ZONE_CSV_OUT = None                # pathlib.Path — zone density CSV 저장 경로
+BATCH_SKIP_HEAVY_OUTPUTS = False         # True: mp4/snapshots/큐 히스토리 생략
+BATCH_ZONE_SAMPLE_INTERVAL = 5.0         # zone density 샘플링 간격 (s)
+
+# 배치 오버라이드 가능 상수 (기본값은 그대로)
+# TAGLESS_RATIO, SIM_TIME, TRAIN_INTERVAL, TRAIN_ALIGHTING는 이미 module-level
 
 
 # =============================================================================
@@ -443,7 +459,7 @@ def run_simulation():
      default_journey_id, default_stage_id,
      exit_upper, exit_lower) = create_simulation()
 
-    rng = np.random.default_rng(42)
+    rng = np.random.default_rng(BATCH_SEED)
     total_steps = int(SIM_TIME / DT)
 
     arrival_times = generate_arrival_schedule(rng, SIM_TIME)
@@ -533,6 +549,16 @@ def run_simulation():
             # 유한 시야 가정: Moussaïd et al. (2011) 기반
             VISION_RANGE = 8.0
             gate_queue = [len(q) for q in sw_queue]
+
+            # 배치 모드: 전용 게이트 필터 (태그리스 전용 vs 태그 전용 상호 배타)
+            # 금지 게이트는 큐 카운트를 크게 하여 LRP 선택에서 배제
+            if BATCH_TAGLESS_ONLY_GATES:
+                if is_tagless:
+                    _forbidden = set(range(N_GATES)) - set(BATCH_TAGLESS_ONLY_GATES)
+                else:
+                    _forbidden = set(BATCH_TAGLESS_ONLY_GATES)
+                for _gi in _forbidden:
+                    gate_queue[_gi] = 99999
             _my_x = stair["x"]  # 계단 위치 기준 (spawn 직전)
             for _other in sim.agents():
                 _oad = agent_data.get(_other.id, {})
@@ -694,6 +720,8 @@ def run_simulation():
             if sw_queue[gi]:
                 head_aid = sw_queue[gi].pop(0)
                 ad = agent_data[head_aid]
+                # 배치: 실제 게이트 서비스 시작 시각 (큐 대기 종료)
+                ad["service_start_time"] = current_time
                 # 태그/태그리스 공통: 서비스 시작 (서비스 시간은 sample_service_time에서 결정)
                 gate_service[gi] = {
                     "agent_id": head_aid,
@@ -712,7 +740,9 @@ def run_simulation():
                         _qad["queue_shift_start"] = current_time
 
         # ── 대기열 내 LRP 재선택 ──
-        if QUEUE_RESELECT_ENABLED and step % int(QUEUE_RESELECT_INTERVAL / DT) == 0:
+        # 배치 모드(전용 게이트): 잭키잉 시 필터 무시로 전용 게이트가 섞이는 문제 방지 → 비활성
+        _jockey_active = QUEUE_RESELECT_ENABLED and not BATCH_TAGLESS_ONLY_GATES
+        if _jockey_active and step % int(QUEUE_RESELECT_INTERVAL / DT) == 0:
             gate_queue_snap = [len(q) for q in sw_queue]
             for gi in range(N_GATES):
                 if gate_queue_snap[gi] < QUEUE_RESELECT_MIN_QUEUE:
@@ -1036,9 +1066,13 @@ def run_simulation():
 
             # 서비스 종료 체크 (한 스텝에 최대 1명 처리 완료)
             if current_time >= s["busy_until"] and s["captured"]:
-                s["captured"].pop(0)
+                _done_aid = s["captured"].pop(0)
                 stats["escalator_processed"][side] += 1
                 s["busy_until"] = 0.0
+                # 배치: sink 도달 시각 기록
+                if _done_aid in agent_data:
+                    agent_data[_done_aid]["sink_time"] = current_time
+                    agent_data[_done_aid]["sink_side"] = side
 
             # busy면 intercept 안 함
             if current_time < s["busy_until"]:
@@ -1057,6 +1091,10 @@ def run_simulation():
                     sim.mark_agent_for_removal(candidate_aid)
                     s["captured"].append(candidate_aid)
                     s["busy_until"] = current_time + ESCALATOR_SERVICE_TIME
+                    # 배치: 에스컬 capture zone 진입 시각
+                    _cad = agent_data.get(candidate_aid)
+                    if _cad is not None:
+                        _cad["escalator_enter_time"] = current_time
                 except Exception as _e:
                     if step % int(5.0 / DT) == 0:
                         print(f"  [escalator {side}] remove fail: {_e}")
@@ -1070,6 +1108,34 @@ def run_simulation():
                 escalator_state["upper"]["queue_len"],
                 escalator_state["lower"]["queue_len"],
             ))
+
+        # ── 배치: Zone density 샘플링 (매 BATCH_ZONE_SAMPLE_INTERVAL 초) ──
+        if (BATCH_ZONE_CSV_OUT is not None
+                and step % int(BATCH_ZONE_SAMPLE_INTERVAL / DT) == 0):
+            # sim 내부 에이전트 + 소프트웨어 큐/서비스 내 에이전트 모두 카운트
+            z1 = z2 = z3 = z4 = 0  # Zone counts
+            # Zone 정의 (x_min, x_max, y_min, y_max)
+            Z1 = (0, CONCOURSE_LENGTH, 0, CONCOURSE_WIDTH)     # 대합실 전체
+            Z2 = (8.0, GATE_X, 9.0, 16.0)                       # 게이트 앞 (4×7)
+            Z3 = (23.0, ESCALATOR_X_START, -1.0, 2.0)          # 에스컬 1 앞
+            Z4 = (23.0, ESCALATOR_X_START, 23.0, 26.0)         # 에스컬 4 앞
+            for _a in sim.agents():
+                _x, _y = _a.position
+                if Z1[0] <= _x <= Z1[1] and Z1[2] <= _y <= Z1[3]: z1 += 1
+                if Z2[0] <= _x <= Z2[1] and Z2[2] <= _y <= Z2[3]: z2 += 1
+                if Z3[0] <= _x <= Z3[1] and Z3[2] <= _y <= Z3[3]: z3 += 1
+                if Z4[0] <= _x <= Z4[1] and Z4[2] <= _y <= Z4[3]: z4 += 1
+            # 소프트웨어 큐에 있는 에이전트도 Zone 2 안에 있다고 카운트 (실제 게이트 앞)
+            _queued = sum(len(q) for q in sw_queue)
+            z2 += _queued
+            z1 += _queued  # 전체 대합실에도 포함
+            # 에스컬 capture 에이전트 (Zone 3/4 포함)
+            z3 += len(escalator_state["lower"]["captured"])
+            z4 += len(escalator_state["upper"]["captured"])
+            z1 += len(escalator_state["lower"]["captured"])
+            z1 += len(escalator_state["upper"]["captured"])
+            stats.setdefault("zone_history", []).append(
+                (current_time, z1, z2, z3, z4))
 
         sim.iterate()
 
@@ -1150,13 +1216,61 @@ def run_simulation():
     if unserviced > 0:
         print(f"\n미통과 에이전트: {unserviced}명")
 
-    print(f"\n출력 생성...")
-    create_snapshots(video_frames, gates, obstacles, gate_openings)
-    create_mp4(video_frames, gates, obstacles, gate_openings)
-    plot_queue_history(stats["queue_history"])
-    plot_service_time_dist(stats["service_times"])
-    save_trajectories(trajectory_data)
-    analyze_trajectories(trajectory_data, gates)
+    # ── 배치: per-agent CSV 저장 (dict id로 중복 제거: 게이트 통과 후 재투입된 ID는 원본과 같은 dict 참조) ──
+    if BATCH_METRICS_OUT is not None:
+        import csv
+        with open(BATCH_METRICS_OUT, "w", newline="", encoding="utf-8") as _f:
+            _w = csv.writer(_f)
+            _w.writerow(["agent_id", "spawn_time", "queue_enter_time",
+                         "service_start_time", "escalator_enter_time",
+                         "sink_time", "travel_time",
+                         "gate_wait_time", "post_gate_time",
+                         "gate_idx", "is_tagless", "sink_side", "serviced"])
+            _seen = set()
+            for _aid, _ad in agent_data.items():
+                _key = id(_ad)
+                if _key in _seen:
+                    continue
+                _seen.add(_key)
+                _st = _ad.get("spawn_time")
+                _qt = _ad.get("queue_enter_time")
+                _sst = _ad.get("service_start_time")
+                _eet = _ad.get("escalator_enter_time")
+                _kt = _ad.get("sink_time")
+                _tt = (_kt - _st) if (_st is not None and _kt is not None) else None
+                # 게이트 대기: queue_enter -> service_start
+                _gwt = (_sst - _qt) if (_qt is not None and _sst is not None) else None
+                # 후처리: service_start -> sink (서비스 + post-gate 보행 + 에스컬 대기)
+                _pgt = (_kt - _sst) if (_sst is not None and _kt is not None) else None
+                _w.writerow([_aid, _st, _qt, _sst, _eet, _kt, _tt,
+                             _gwt, _pgt,
+                             _ad.get("gate_idx"),
+                             int(_ad.get("is_tagless", False)),
+                             _ad.get("sink_side", ""),
+                             int(_ad.get("serviced", False))])
+        print(f"  [배치] per-agent metrics -> {BATCH_METRICS_OUT}")
+
+    # ── 배치: zone density CSV 저장 ──
+    if BATCH_ZONE_CSV_OUT is not None and stats.get("zone_history"):
+        import csv
+        with open(BATCH_ZONE_CSV_OUT, "w", newline="", encoding="utf-8") as _f:
+            _w = csv.writer(_f)
+            _w.writerow(["time", "zone1_count", "zone2_count",
+                         "zone3_count", "zone4_count"])
+            for _row in stats["zone_history"]:
+                _w.writerow(_row)
+        print(f"  [배치] zone density -> {BATCH_ZONE_CSV_OUT}")
+
+    if not BATCH_SKIP_HEAVY_OUTPUTS:
+        print(f"\n출력 생성...")
+        create_snapshots(video_frames, gates, obstacles, gate_openings)
+        create_mp4(video_frames, gates, obstacles, gate_openings)
+        plot_queue_history(stats["queue_history"])
+        plot_service_time_dist(stats["service_times"])
+        save_trajectories(trajectory_data)
+        analyze_trajectories(trajectory_data, gates)
+    else:
+        print(f"\n[배치] heavy outputs 스킵")
 
     return stats, spawned_count
 
@@ -1209,9 +1323,13 @@ def draw_frame(ax, positions, gates, obstacles, gate_openings, time_sec):
                 ha='center', va='center', fontsize=7, fontweight='bold', color='#1B5E20', zorder=4)
 
     for stair in STAIRS:
-        ax.plot([stair["x"], stair["x"]],
-                [stair["y_start"], stair["y_end"]],
-                color='#E53935', linewidth=3, solid_capstyle='round')
+        xs_s, xs_e = stair["x_start"], stair["x_end"]
+        ys_s, ys_e = stair["y_start"], stair["y_end"]
+        ax.add_patch(mpatches.Rectangle(
+            (xs_s, ys_s), xs_e - xs_s, ys_e - ys_s,
+            facecolor='#FFCCBC', edgecolor='#E53935', linewidth=1.0, alpha=0.35))
+        ax.plot([xs_s, xs_s], [ys_s, ys_e],
+                color='#E53935', linewidth=2, solid_capstyle='round')
 
     for exit_ in EXITS:
         ax.plot([exit_["x_start"], exit_["x_end"]],
@@ -1252,8 +1370,8 @@ def draw_frame(ax, positions, gates, obstacles, gate_openings, time_sec):
             bbox=dict(boxstyle='round,pad=0.3', facecolor='white',
                       edgecolor='#999', alpha=0.9))
 
-    ax.set_xlim(-0.5, 32)
-    ax.set_ylim(-0.5, CONCOURSE_WIDTH + 0.5)
+    ax.set_xlim(-0.5, 36)
+    ax.set_ylim(-1.5, CONCOURSE_WIDTH + 1.5)
     ax.set_aspect('equal')
     ax.set_xlabel('x (m)', fontsize=9)
     ax.set_ylabel('y (m)', fontsize=9)

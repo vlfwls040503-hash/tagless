@@ -116,7 +116,7 @@ CARD_FEEDING_TIME = 1.1
 GATE_PASS_SPEED = 0.65
 GATE_PHYS_LENGTH = 1.4
 
-TAGLESS_SERVICE_TIME = 1.2    # 게이트 물리 통과 시간 (1.5m / 1.3m/s)
+TAGLESS_SERVICE_TIME = 0.0    # 태그리스: 서비스 시간 없음 (즉시 통과, 물리 이동만)
 TAGLESS_RATIO = 1.0           # 단일 sim 기본값 (배치는 scenario_matrix가 override)
 
 # =============================================================================

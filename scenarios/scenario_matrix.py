@@ -40,7 +40,7 @@ TAGLESS_ONLY_BY_CONFIG = {
 # 배치 오버라이드 상수
 TRAIN_INTERVAL = 150.0
 TRAIN_ALIGHTING = 200
-SIM_TIME = 300.0  # v2: 120→300s 확장
+SIM_TIME = 600.0  # 2026-04-24: 300→600s 확장, pass_rate 편향 제거 (2편 완전 처리)
 
 
 def iter_scenarios():

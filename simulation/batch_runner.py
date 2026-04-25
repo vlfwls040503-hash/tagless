@@ -41,6 +41,9 @@ RESULTS_DIR = ROOT / "results"  # main()에서 --results-dir로 override
 RAW_DIR = RESULTS_DIR / "raw"
 LOG_PATH = RESULTS_DIR / "execution_log.txt"
 FAIL_LOG = RESULTS_DIR / "failures.txt"
+SAVE_TRAJECTORY = False  # main()에서 --save-traj로 켬
+MODEL = "cfsm"           # "cfsm" or "avm"
+ESC_SERVICE_TIME = None  # main()에서 override
 
 
 def log(msg):
@@ -54,7 +57,10 @@ def log(msg):
 def run_one_scenario(sid, params):
     """단일 시나리오 실행. 성공 시 (wall_time, spawned, passed) 반환. 실패 시 예외 rethrow."""
     # runner 모듈을 매 실행마다 reload - 전역 상태(trajectory_data 누적 등) 초기화
-    import run_west_simulation_cfsm_escalator as runner
+    if MODEL == "avm":
+        import run_west_simulation_avm_demo as runner
+    else:
+        import run_west_simulation_cfsm_escalator as runner
     importlib.reload(runner)
 
     # 파라미터 적용 (module globals 덮어쓰기)
@@ -68,6 +74,14 @@ def run_one_scenario(sid, params):
     runner.BATCH_ZONE_CSV_OUT = RAW_DIR / f"zones_{sid}.csv"
     runner.BATCH_OUTPUT_SUFFIX = f"_{sid}"
     runner.BATCH_SKIP_HEAVY_OUTPUTS = True  # mp4/snapshot 생략
+    # v3: trajectory 저장 (--save-traj 옵션으로 켜짐)
+    if SAVE_TRAJECTORY:
+        runner.BATCH_SAVE_TRAJECTORY = True
+        runner.BATCH_TRAJECTORY_OUT = RAW_DIR / f"trajectory_{sid}.csv"
+        runner.BATCH_TRAJECTORY_INTERVAL = 0.5
+    # v6: 에스컬 capacity override
+    if ESC_SERVICE_TIME is not None:
+        runner.BATCH_ESC_SERVICE_TIME = ESC_SERVICE_TIME
 
     t0 = time.time()
     stats, spawned = runner.run_simulation()
@@ -82,7 +96,7 @@ def aggregate_summary_row(sid, params, stats, spawned, passed):
 
     # per-agent CSV 읽어서 travel time 집계
     agent_csv = RAW_DIR / f"agents_{sid}.csv"
-    travel_times, gate_waits, post_gates = [], [], []
+    travel_times, gate_waits, post_gates, esc_precise = [], [], [], []
     n_exit1 = n_exit4 = 0
     if agent_csv.exists():
         with open(agent_csv, "r", encoding="utf-8") as f:
@@ -97,25 +111,44 @@ def aggregate_summary_row(sid, params, stats, spawned, passed):
                 pg = row.get("post_gate_time")
                 if pg and pg != "None":
                     post_gates.append(float(pg))
+                ewp = row.get("esc_wait_precise")
+                if ewp and ewp != "None":
+                    esc_precise.append(float(ewp))
                 side = row.get("sink_side", "")
                 if side == "lower": n_exit1 += 1
                 elif side == "upper": n_exit4 += 1
     travel_times = np.array(travel_times) if travel_times else np.array([])
     gate_waits = np.array(gate_waits) if gate_waits else np.array([])
     post_gates = np.array(post_gates) if post_gates else np.array([])
+    esc_precise = np.array(esc_precise) if esc_precise else np.array([])
 
     # zone density
     zone_csv = RAW_DIR / f"zones_{sid}.csv"
-    # zone 면적 (배치 설정과 일치)
-    AREAS = {"z1": 50 * 25, "z2": 4 * 7, "z3": 2 * 3, "z4": 2 * 3}
-    zone_series = {"z1": [], "z2": [], "z3": [], "z4": []}
+    # v3: zone 면적 (세분화)
+    AREAS = {
+        "z1": 50 * 25, "z2": 4 * 7,
+        "z3a": 8 * 3, "z3b": 2 * 3, "z3c": 10 * 3,
+        "z4a": 8 * 3, "z4b": 2 * 3, "z4c": 10 * 3,
+    }
+    zone_series = {k: [] for k in AREAS}
     if zone_csv.exists():
+        # v3 포맷: time, zone1_count, zone2_count, zone3a, zone3b, zone3c, zone4a, zone4b, zone4c
+        # v2 포맷: time, zone1_count, zone2_count, zone3_count, zone4_count
         with open(zone_csv, "r", encoding="utf-8") as f:
-            r = csv.DictReader(f)
-            for row in r:
-                for i, zk in enumerate(["z1", "z2", "z3", "z4"], 1):
-                    c = int(row[f"zone{i}_count"])
-                    zone_series[zk].append(c / AREAS[zk])
+            reader = csv.reader(f)
+            header = next(reader)
+            is_v3 = "zone3a_count" in header
+            for row in reader:
+                if is_v3:
+                    t, z1, z2, z3a, z3b, z3c, z4a, z4b, z4c = row
+                    vals = {"z1": z1, "z2": z2, "z3a": z3a, "z3b": z3b,
+                            "z3c": z3c, "z4a": z4a, "z4b": z4b, "z4c": z4c}
+                else:
+                    t, z1, z2, z3, z4 = row
+                    vals = {"z1": z1, "z2": z2, "z3b": z3, "z4b": z4,
+                            "z3a": 0, "z3c": 0, "z4a": 0, "z4c": 0}
+                for k in AREAS:
+                    zone_series[k].append(int(vals[k]) / AREAS[k])
 
     def _stat(series, fn, default=0.0):
         return float(fn(series)) if series else default
@@ -137,6 +170,9 @@ def aggregate_summary_row(sid, params, stats, spawned, passed):
         "p95_gate_wait": float(np.percentile(gate_waits, 95)) if len(gate_waits) else 0.0,
         "avg_post_gate": float(post_gates.mean()) if len(post_gates) else 0.0,
         "p95_post_gate": float(np.percentile(post_gates, 95)) if len(post_gates) else 0.0,
+        "avg_esc_wait_precise": float(esc_precise.mean()) if len(esc_precise) else 0.0,
+        "p95_esc_wait_precise": float(np.percentile(esc_precise, 95)) if len(esc_precise) else 0.0,
+        "n_esc_precise": len(esc_precise),
         "n_exit1": n_exit1,
         "n_exit4": n_exit4,
         "exit1_share": exit1_share,
@@ -144,10 +180,18 @@ def aggregate_summary_row(sid, params, stats, spawned, passed):
         "zone1_max_density": _stat(zone_series["z1"], np.max),
         "zone2_avg_density": _stat(zone_series["z2"], np.mean),
         "zone2_max_density": _stat(zone_series["z2"], np.max),
-        "zone3_avg_density": _stat(zone_series["z3"], np.mean),
-        "zone3_max_density": _stat(zone_series["z3"], np.max),
-        "zone4_avg_density": _stat(zone_series["z4"], np.mean),
-        "zone4_max_density": _stat(zone_series["z4"], np.max),
+        "zone3a_avg_density": _stat(zone_series["z3a"], np.mean),
+        "zone3a_max_density": _stat(zone_series["z3a"], np.max),
+        "zone3b_avg_density": _stat(zone_series["z3b"], np.mean),
+        "zone3b_max_density": _stat(zone_series["z3b"], np.max),
+        "zone3c_avg_density": _stat(zone_series["z3c"], np.mean),
+        "zone3c_max_density": _stat(zone_series["z3c"], np.max),
+        "zone4a_avg_density": _stat(zone_series["z4a"], np.mean),
+        "zone4a_max_density": _stat(zone_series["z4a"], np.max),
+        "zone4b_avg_density": _stat(zone_series["z4b"], np.mean),
+        "zone4b_max_density": _stat(zone_series["z4b"], np.max),
+        "zone4c_avg_density": _stat(zone_series["z4c"], np.mean),
+        "zone4c_max_density": _stat(zone_series["z4c"], np.max),
     }
 
 
@@ -159,14 +203,24 @@ def main():
                     help="시뮬 1회 최대 허용 시간 (분) - 초과 시 중단")
     ap.add_argument("--results-dir", default="results",
                     help="출력 디렉토리 (ROOT 기준 상대, 기본 results)")
+    ap.add_argument("--save-traj", action="store_true",
+                    help="trajectory CSV도 저장 (v3)")
+    ap.add_argument("--model", choices=["cfsm", "avm"], default="cfsm",
+                    help="물리 모델 (cfsm=기본, avm=Anticipation)")
+    ap.add_argument("--esc-service-time", type=float, default=None,
+                    help="에스컬 처리시간 override (초). 기본 SPACE 값 0.85")
     args = ap.parse_args()
 
-    global RESULTS_DIR, RAW_DIR, LOG_PATH, FAIL_LOG
+    global RESULTS_DIR, RAW_DIR, LOG_PATH, FAIL_LOG, SAVE_TRAJECTORY, MODEL, ESC_SERVICE_TIME
     RESULTS_DIR = ROOT / args.results_dir
     RAW_DIR = RESULTS_DIR / "raw"
     RAW_DIR.mkdir(parents=True, exist_ok=True)
     LOG_PATH = RESULTS_DIR / "execution_log.txt"
     FAIL_LOG = RESULTS_DIR / "failures.txt"
+    SAVE_TRAJECTORY = args.save_traj
+    MODEL = args.model
+    ESC_SERVICE_TIME = args.esc_service_time
+    log(f"모델: {MODEL.upper()}, esc_service_time={ESC_SERVICE_TIME}")
 
     scenarios = list(iter_scenarios())
 

@@ -57,7 +57,7 @@ plt.rcParams['axes.unicode_minus'] = False
 # =============================================================================
 # 시뮬레이션 파라미터
 # =============================================================================
-SIM_TIME = 120.0  # 열차 1편 + 큐 처리 여유 (영상과 동일)
+SIM_TIME = 300.0  # p=0.7 cfg1 장기 정체 시각화 (batch 와 동일 조건)
 DT = 0.05
 
 # =============================================================================
@@ -72,8 +72,8 @@ PLATFORM_LENGTH = 105.0       # 승강장 길이 (m)
 ALIGHTING_DELAY_MAX = 10.0    # 하차 지연 최대 (s)
 STAIR_DESCENT_TIME = 12.0     # 계단 하행 시간 (s) — ~10m, 0.85m/s
 STAIR_TO_GATE_DIST = 11.0     # 계단 하부 → 게이트 구간 거리 (m)
-WALK_SPEED_MEAN = 1.34        # 플랫폼 보행속도 평균 (m/s)
-WALK_SPEED_STD = 0.26         # 플랫폼 보행속도 표준편차 (m/s)
+WALK_SPEED_MEAN = 1.20        # 한국 도시철도 통근자 표준 (서울교통공사 환승소요시간 기준)
+WALK_SPEED_STD = 0.20         # 한국화로 분산 약간 축소
 FIRST_TRAIN_TIME = 5.0
 
 # 계단 방출율 (Weidmann 1993: 1.25명/s/m, 하행)
@@ -84,12 +84,13 @@ STAIR_CAPACITY = STAIR_WIDTH * STAIR_DISCHARGE_RATE  # ~4.6명/s per stair
 # =============================================================================
 # 보행자 속도 파라미터
 # =============================================================================
-# N(1.34, 0.26), clip(0.8, 2.0)
-# 근거: Weidmann (1993) 평균 1.34 m/s, std 약 0.26.
-# 한국 지하철 실측(서울교통공사·혼잡도 관측) 범위 0.8~2.0 m/s 부합.
+# N(1.20, 0.20), clip(0.8, 2.0)
+# 근거: 서울교통공사 환승소요시간 기준 1.2 m/s, KOTI/국토부 환승편의시설 동일.
+# 한국인 자유보행 1.29 m/s (이창희·김대현 2020) 보다 통근자 시설 내 표준이 더 낮음.
+# Weidmann (1993) 1.34 m/s 는 서양 기준 — 한국 도시철도 약간 과대.
 # Agent별 속성으로 spawn 시 1회 고정 (이후 상수 유지).
-PED_SPEED_MEAN = 1.34
-PED_SPEED_STD = 0.26
+PED_SPEED_MEAN = 1.20
+PED_SPEED_STD = 0.20
 PED_SPEED_MIN = 0.8
 PED_SPEED_MAX = 2.0
 
@@ -109,14 +110,14 @@ DENSITY_R = 2.0         # 밀도 측정 반경 (m)
 # =============================================================================
 # 서비스 시간 파라미터 (Gao et al., 2019)
 # =============================================================================
-SERVICE_TIME_MEAN = 2.0
-SERVICE_TIME_MIN = 0.8
-SERVICE_TIME_MAX = 3.7
+SERVICE_TIME_MEAN = 2.7        # 태그: 평균 2.7s (Beijing 실측 + 한국 플랩식, lognormal)
+SERVICE_TIME_MIN = 1.0
+SERVICE_TIME_MAX = 5.0
 CARD_FEEDING_TIME = 1.1
 GATE_PASS_SPEED = 0.65
 GATE_PHYS_LENGTH = 1.4
 
-TAGLESS_SERVICE_TIME = 0.0    # 태그리스: 서비스 시간 없음 (즉시 통과, 물리 이동만)
+TAGLESS_SERVICE_TIME = 1.2    # 태그리스: 물리 통과시간 (1.5m / 1.3m/s, Weidmann 기반)
 TAGLESS_RATIO = 1.0           # 단일 sim 기본값 (배치는 scenario_matrix가 override)
 
 # =============================================================================
@@ -167,7 +168,7 @@ OUTPUT_DIR.mkdir(exist_ok=True)
 # 배치 런 파라미터 (batch_runner가 monkey-patch, 기본값은 기존 동작 유지)
 # =============================================================================
 BATCH_SEED = 42                          # rng 시드
-BATCH_TAGLESS_ONLY_GATES = frozenset()   # 단일 sim 기본값 (배치는 scenario_matrix가 override)
+BATCH_TAGLESS_ONLY_GATES = frozenset({2, 4})   # cfg2: G3, G5 태그리스 전용
                                          # 비어있으면 기존 동작 (모든 게이트 공용)
 BATCH_OUTPUT_SUFFIX = ""                 # 출력 파일 suffix (배치 시 시나리오 id)
 BATCH_METRICS_OUT = None                 # pathlib.Path — per-agent CSV 저장 경로
@@ -823,30 +824,47 @@ def run_simulation():
                 if current_time - svc["start"] >= svc["duration"]:
                     aid_done = svc["agent_id"]
                     ad = agent_data[aid_done]
-                    # 게이트 출구에 에이전트 재투입
+                    # ★ 2026-04-24: 재투입 실패 방지 — 위치 조정 재시도
+                    # 기존: 단일 위치 (13.5, gate_y) 에서 실패 시 agent 소실
+                    # 개선: post_gate 근처 여러 위치 시도 (x, y 노이즈) + 실패 시 대기
                     gate_y = gates[gi]["y"]
-                    try:
-                        new_aid = sim.add_agent(
-                            jps.CollisionFreeSpeedModelV2AgentParameters(
-                                journey_id=post_journey_ids[gi],
-                                stage_id=post_gate_wp_ids[gi],
-                                position=(GATE_X + GATE_LENGTH + 0.3, gate_y),
-                                time_gap=CFSM_TIME_GAP,
-                                desired_speed=ad["original_speed"],
-                                radius=CFSM_RADIUS,
-                                strength_neighbor_repulsion=8.0,
-                                range_neighbor_repulsion=0.1,
-                                strength_geometry_repulsion=5.0,
-                                range_geometry_repulsion=0.02,
-                            ))
-                        # 새 ID에 기존 데이터 매핑
-                        agent_data[new_aid] = ad
-                        ad["serviced"] = True
-                        passed_agents.add(aid_done)
-                        stats["service_times"].append(svc["duration"])
-                        stats["gate_counts"][gi] += 1
-                    except Exception:
-                        pass
+                    _reinject_ok = False
+                    _base_x = GATE_X + GATE_LENGTH + 0.3
+                    for _rx in range(6):
+                        _try_x = _base_x + _rx * 0.15   # x 0.15m 간격으로 6회
+                        for _ry_off in [0.0, 0.15, -0.15, 0.25, -0.25]:
+                            _try_y = gate_y + _ry_off
+                            try:
+                                new_aid = sim.add_agent(
+                                    jps.CollisionFreeSpeedModelV2AgentParameters(
+                                        journey_id=post_journey_ids[gi],
+                                        stage_id=post_gate_wp_ids[gi],
+                                        position=(_try_x, _try_y),
+                                        time_gap=CFSM_TIME_GAP,
+                                        desired_speed=ad["original_speed"],
+                                        radius=CFSM_RADIUS,
+                                        strength_neighbor_repulsion=8.0,
+                                        range_neighbor_repulsion=0.1,
+                                        strength_geometry_repulsion=5.0,
+                                        range_geometry_repulsion=0.02,
+                                    ))
+                                # 새 ID 에 기존 데이터 매핑
+                                agent_data[new_aid] = ad
+                                ad["serviced"] = True
+                                passed_agents.add(aid_done)
+                                stats["service_times"].append(svc["duration"])
+                                stats["gate_counts"][gi] += 1
+                                _reinject_ok = True
+                                break
+                            except Exception:
+                                continue
+                        if _reinject_ok:
+                            break
+                    if not _reinject_ok:
+                        # 재투입 모두 실패 → 서비스 상태 유지, 다음 step 재시도
+                        stats.setdefault("reinject_retry", 0)
+                        stats["reinject_retry"] += 1
+                        continue
                     gate_service[gi] = {"clearing": True, "clear_start": current_time}
                 continue
 
@@ -1459,6 +1477,11 @@ def run_simulation():
             _queued = sum(len(q) for q in sw_queue)
             z2 += _queued
             z1 += _queued
+            # 에스컬 가상 큐 (슬롯 대기) agent 를 Z3B/Z4B 에 포함 — 2026-04-22
+            # (esc_sw_queue agent 들은 sim.agents()에서 제거됨)
+            z3b += len(esc_sw_queue["lower"])   # lower = exit1 = Z3B
+            z4b += len(esc_sw_queue["upper"])   # upper = exit4 = Z4B
+            z1  += len(esc_sw_queue["lower"]) + len(esc_sw_queue["upper"])
             # 에스컬 capture 에이전트는 Z3C/Z4C (서비스 중)에 포함
             z3c += len(escalator_state["lower"]["captured"])
             z4c += len(escalator_state["upper"]["captured"])
@@ -1786,7 +1809,7 @@ def create_snapshots(frames, gates, obstacles, gate_openings):
 def create_mp4(frames, gates, obstacles, gate_openings):
     from matplotlib.animation import FuncAnimation, FFMpegWriter
     import imageio_ffmpeg
-    target_frames = [(t, pos) for t, pos in frames if t <= 120]
+    target_frames = [(t, pos) for t, pos in frames if t <= SIM_TIME]
     if not target_frames:
         return
     fig, ax = plt.subplots(figsize=(14, 8))

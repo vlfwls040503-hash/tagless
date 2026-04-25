@@ -104,12 +104,13 @@ SPACE = {
     ],
 
     # 계단 (대합실=승강장 2D 겹침, 가로 통로)
+    # 2026-04-24: 실측 도면 반영, 폭 3m → 4.5m (게이트 클러스터 9.95~15.05 와 비충돌)
     "stairs": [
         {"id": "upper", "x_start": 1.0, "x_end": 11.0,
-         "y_start": 15.0, "y_end": 18.0,
+         "y_start": 15.0, "y_end": 19.5,
          "spawn_x_offset_range": (0.5, 2.5)},
         {"id": "lower", "x_start": 1.0, "x_end": 11.0,
-         "y_start": 8.0,  "y_end": 11.0,
+         "y_start": 5.5,  "y_end": 10.0,
          "spawn_x_offset_range": (0.5, 2.5)},
     ],
 
@@ -169,11 +170,12 @@ SPACE = {
     ],
 
     # 에이전트 spawn 영역 (각 계단 동쪽 끝 부근)
+    # 2026-04-24: 계단 폭 4.5m 반영
     "spawn_areas": [
         {"id": "from_stair_upper", "stair_id": "upper",
-         "x_range": (1.5, 3.5), "y_range": (15.0, 18.0)},
+         "x_range": (1.5, 3.5), "y_range": (15.0, 19.5)},
         {"id": "from_stair_lower", "stair_id": "lower",
-         "x_range": (1.5, 3.5), "y_range": (8.0, 11.0)},
+         "x_range": (1.5, 3.5), "y_range": (5.5, 10.0)},
     ],
 
     # Sink (지상 도달)

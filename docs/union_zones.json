@@ -1,0 +1,46 @@
+{
+  "metadata": {
+    "method": "wait = (state==queue) OR (state==passed AND speed<0.5 m/s)",
+    "source": "results_cfsm_latest/raw (cfg 1~4, pass_rate>=0.9)",
+    "n_scenarios_used": 105,
+    "warmup_excluded_s": 90.0,
+    "bin_m": 0.5,
+    "threshold": 76.2667,
+    "dilation": 2,
+    "buffer_m": 0.25
+  },
+  "zones": [
+    {
+      "x_range": [
+        -2.25,
+        14.75
+      ],
+      "y_range": [
+        9.25,
+        15.75
+      ],
+      "area_m2": 110.5,
+      "peak_density": 953.3333,
+      "total_intensity": 14346.4143,
+      "n_cells": 181,
+      "id": "W1",
+      "name": "W_gate"
+    },
+    {
+      "x_range": [
+        23.75,
+        28.75
+      ],
+      "y_range": [
+        20.75,
+        24.75
+      ],
+      "area_m2": 20.0,
+      "peak_density": 201.6952,
+      "total_intensity": 1078.8905,
+      "n_cells": 29,
+      "id": "W2",
+      "name": "W_esc_upper"
+    }
+  ]
+}

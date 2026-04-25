@@ -291,6 +291,46 @@ for _other in sim.agents():
 **효과**: #9와 유사한 분산 효과 유지하면서 현실성 ↑ (게이트별 편차 2로 동일)
 **증상 (되돌릴 경우)**: 비현실적으로 완벽한 예측 → 논문 공격 포인트.
 
+### 14. 에스컬레이터 하류 병목 최종본 (2026-04-20, simulation_escalator_v12_win.mp4)
+**위치**: `simulation/run_west_simulation_cfsm_escalator.py`
+**최종 영상**: `output/simulation_escalator_v12_win.mp4`
+
+**절대 변경 금지 항목:**
+
+**(a) 에스컬레이터 위치 (x+2 이동)**
+- `docs/space_layout.py`: capture_zone x_range `(26.5, 28.0)`, waypoint `(27.0, ...)`
+- `create_simulation()`: `escalator_wp_upper=(28.0, 25.5)`, `escalator_wp_lower=(28.0, -0.5)`
+- approach_wp: `(25.5, 23.5)` / `(25.5, 1.5)`
+- ESC_QUEUE_SLOTS: upper x=25.2/25.7/26.2, lower x=25.2/25.7/26.2
+- ESC_APPROACH_UPPER/LOWER: `(25.5, 23.5)` / `(25.5, 1.5)`
+**이유**: 이 위치에서 stop-and-go + 시야 기반 대기가 가장 자연스럽게 작동.
+
+**(b) Funnel 벽 원래 위치**
+```python
+_Poly([(30.0, 25.0), (35.0, 25.0), (35.0, 26.0), (30.0, 26.0)]),  # 동측 캡
+_Poly([(30.0, -1.0), (35.0, -1.0), (35.0,  0.0), (30.0,  0.0)]),
+_Poly([(19.8, 21.8), (20.2, 22.2), (22.9, 24.9), (22.5, 24.5)]),  # 대각 upper
+_Poly([(19.8,  3.2), (20.2,  2.8), (22.7,  0.3), (22.3,  0.7)]),  # 대각 lower
+```
+**이유**: 대각 벽이 x+2 이동하면 corridor 입구를 막아 병목 발생. 원래 위치(x=19.8~22.9)가 올바름.
+**증상 (되돌릴 경우)**: 에이전트들이 corridor로 진입 못하고 병목 형성.
+
+**(c) 시야 기반 대기 로직 (VISION_R=2.5, VISION_DOT_TH=0.3)**
+**위치**: 메인 루프 내 `if step % 2 == 0:` 블록
+**이유**: 이 로직 없으면 에이전트들이 에스컬레이터 앞에서 stop-and-go 없이 밀고 들어감.
+파라미터(VISION_R, VISION_DOT_TH 등)만 존재하고 적용 코드 없으면 완전 동일 — 반드시 코드도 유지.
+**증상 (제거 시)**: stop-and-go 전혀 없음, 시야 적용 안 됨.
+
+**(d) Slot-based stop-and-go (`model.v0` 사용)**
+**위치**: `# ── 에스컬 큐 에이전트 stop-and-go` 블록
+`sim.agent(_aid).model.v0 = _new_v0` — **`desired_speed`로 바꾸면 안 됨**
+**이유**: `model.v0`는 deprecated setter지만 경고 모드에서 정상 작동. `desired_speed`와 동일하나 v7 검증된 버전 유지.
+
+**(e) capture zone 강제 흡수 로직**
+**위치**: `# 강제 진입` 블록 (큐 비어있을 때 capture zone 내 에이전트 직접 흡수)
+**이유**: 큐 없는 상황에서 에스컬레이터 앞 에이전트가 대기만 하다 막히는 현상 방지.
+**증상 (제거 시)**: 큐 비어도 에이전트가 에스컬레이터 앞에서 멈춤.
+
 ---
 
 ## 핵심 파라미터 (run_west_simulation_cfsm.py)
@@ -330,12 +370,13 @@ python simulation/compare_scenarios.py                    # 시나리오 비교
 python simulation/calibrate_cfsm.py                       # FZJ 보정
 ```
 
-## 에스컬레이터 병목 구현 메모 (2026-04-17)
+## 에스컬레이터 병목 구현 메모 (2026-04-20 최종 확정)
 
-- **기각된 접근**: 깔때기 벽(funnel) — 실제 성수역 기하에 없음. 시뮬 수렴 트릭에 그침.
-- **기각된 접근**: 난간 벽 — 동일 이유 + 과도한 물리 제약.
-- **기각된 접근**: 밀도 기반 desired_speed — 진동 원인은 속도 아닌 방향 불안정 (CFSM 등방성).
-- **채택된 접근**: 시야 기반 대기 (전방 60° 콘) + 소프트웨어 큐 + front-most 면제 + busy 측 국지화.
+- **최종 영상**: `output/simulation_escalator_v12_win.mp4`
+- **채택된 접근**: 시야 기반 대기 (전방 72° 콘, VISION_R=2.5) + 소프트웨어 슬롯 큐 + front-most 면제 + capture zone 강제 흡수.
+- **에스컬레이터 위치**: x+2 이동 (capture_zone x=26.5~28.0).
+- **Funnel**: 대각 벽 원래 위치(x=19.8~22.9) 유지 — x+2 이동 시 corridor 병목 발생 확인.
+- **시야 로직 주의**: 파라미터(VISION_R 등) 정의만으로는 적용 안 됨 — 루프 내 `step % 2 == 0` 블록 필수.
 - **AVM 교체 보류**: 전체 시뮬 V&V 재수행 부담. 후속 과제.
 - **현 실효 처리율**: upper 0.68 / lower 0.65 ped/s (목표 1.17 ped/s)
 - **참고 문헌**: `docs/선행연구_암묵적병목.md` (Xu 2021 AVM, Rzezonka 2022 등 14편)
